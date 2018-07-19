@@ -1,0 +1,11 @@
+deborphan					install
+dnsutils					install
+emacs						install
+fail2ban					install
+geoip-bin					install
+less						install
+libpng12-0					install
+openssh-client					install
+openssh-server					install
+xaw3dg                                   	install
+xterm						install

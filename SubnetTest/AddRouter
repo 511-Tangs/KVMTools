@@ -1,0 +1,17 @@
+#!/bin/bash
+
+if [ $# != 3 ]
+  then echo "$0 Ip1 Ip2 Mask in dotted decimal format."
+       exit 1
+fi
+
+Return=`SameSubnetP $1 $2 $3`
+
+if [ x"${Return}" == x"1" ]
+  then echo "Return value: x\"${Return}\" "
+       echo "route add $1/32 dev eth0"
+elif [ x"${Return}" == x"0" ]
+  then echo "Return value: x\"${Return}\" "
+       echo "Ip1 and Ip2 are in the same subnet" 
+else echo "Something wrong about  $1 $2 $3"
+fi

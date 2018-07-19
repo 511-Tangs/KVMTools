@@ -1,0 +1,2779 @@
+#!/bin/bash
+### Function Table
+
+# Print Help
+function PrtHelp() {
+    clear
+    echo -ne "
+======================================================================
+      This script is used to create shell scripts (for qemu-system-*)
+      for booting or shutting down virtual machine.                   
+======================================================================
+"
+echo -ne "
+Usage: $0 HostName \"hda.img hdb.img ... \" \"ip0,ether-card[,gateway0] ip1,ether-card ...\" [\"shared-path:mount-point\"]
+
+Tips: HostName, the string to be stored in the /etc/hostname file of VM.
+Tips: hda.img can be a raw image or a rootfs stored in some nfs server. 
+      In the 2nd case, use the following syntax to specify it: 
+            \"nfs-ip:nfs-root_file_system_path\"
+      Also in this 2nd case, you need a local image carried via the hdb.img 
+      argument.  The /etc, /home, /var, and /usr/local, 4 directories of the 
+      original nfs rootfs, will be replaced by the filesystems created in the 
+      local image. 
+Tips: ether-card[0-9], the physical ether device of the host, such as eth0, 
+      used by VM to carry its network packets in and out of VM.  Our VM can 
+      have multiple virtual ether cards. 
+Tips: The 4th parameter is optional. We may use it to export some filesystems, 
+      such as /src1, /usr/local, of our host to VM.  By default, the filesystems
+      will be exported in read-only mode.  For example, to export /src1 with 
+      mount point /mnt in VM, using syntax: \"/src1:/mnt\".
+"
+
+}
+
+# Print Info
+function PrtInfo() {
+    echo -ne "\e[1;49;92m[INFO] $@\e[m\n"
+}
+
+# Print Warn
+function PrtWarn() {
+    echo -ne "\e[1;49;93m[WARN] $@\e[m\n"
+}
+
+# Print Error
+function PrtErr() {
+    echo -ne "\e[1;49;91m[ERROR] $@\e[m\n"
+    exit 1 
+}
+
+# Check file is newer
+function CheckNewer() {
+    local test checktest ii testlen
+    # Read all file into array
+    readarray -t test< <(tr " " "\n" <<<$@)
+    # Math Length of array
+    testlen=${#test[@]}
+    # First file
+    checktest=${test[0]}
+    # Test 1 - Length file 
+    for ii in $(seq 1 ${testlen});do
+	# if file B is newer than file A, then keep files B and loop another files.
+	if [[ ${test[$ii]} -nt ${checktest} ]]; then
+	    checktest=${test[$ii]}
+	fi
+    done
+    # Print the newest file
+    echo "$checktest"
+}
+
+# Check Host package
+function CheckNeededPackages() {
+    local Ans
+    
+    if [ ! -f /sbin/fdisk ]; then
+	echo -ne "fdisk not installed.\n"
+	Ans=No
+    fi
+
+    if [ ! -f /sbin/parted ]; then
+	echo -ne "parted not installed.\n"
+	Ans=No
+    fi
+
+    if [ ! -f /usr/bin/partx ]; then
+	echo -ne "util-linux not installed.\n"
+	Ans=No
+    fi
+
+    if [ ! -f /usr/bin/file ]; then
+	echo -ne "package: file not installed.\n"
+	Ans=No
+    fi
+
+    if [ ! -f /bin/ip ]; then
+	echo -ne "iproute2 not installed.\n"
+	Ans=No
+    fi
+
+    if [ ! -f /bin/egrep ]; then
+	echo -ne "grep not installed. \n"
+	Ans=No
+    fi
+
+    if [ ! -f  /usr/bin/md5sum ]; then
+	echo -ne "coreutils not installed.\n"
+	Ans=No
+    fi
+
+    which qemu-nbd &>/dev/null
+    if [ "$?" -ne "0"  ]; then
+	echo -ne "qemu-nbd not installed.\n"
+	Ans=No
+	
+    fi
+
+    if [ ! -f /sbin/mount.nfs ]; then
+	echo -ne "nfs-common not installed.\n"
+	Ans=No
+    fi
+
+    if [ ! -f /sbin/losetup  ]; then
+	ecno -ne "mount not installed.\n"
+	Ans=No
+    fi
+
+    if [ ! -f /usr/bin/objdump ]; then
+	echo -ne "binutils not installed.\n"
+	Ans=No
+    fi
+
+    if [ ! "$Ans" == "No" ]; then
+	echo "Yes"
+    fi
+    
+    
+    
+}
+
+# Check kernel modules
+function CheckKernelModules() {
+    local Ans
+    # nbd
+    find /lib/modules/ | grep .ko | grep nbd &>/dev/null
+    if [ "$?" -ne "0" ]; then
+	echo -ne "nbd modules not found."
+	Ans=No
+    fi
+
+    if [ ! "$Ans" == "No" ]; then
+       echo "Yes"
+    fi
+
+}
+
+# Check ether card correct
+function CheckEth() {
+    local eth ethlen checketh checkethlen Ans
+    checketh=$1
+
+    ##OldWay
+    ## Load all exist ether card into array
+    ##readarray -t eth< <(/bin/ip link show | egrep -o "^[0-9]+: [0-9a-z]+[0-9]+" | awk -F ' ' '{print $2 }')
+    ##ethLen=$(( ${#eth[@]} -1 ))
+    ## If any ether card is matched, then Ans == Yes
+    ##for ii in $(seq 0 ${ethLen} ); do
+	##if [[ "${checketh}" == "${eth[$ii]}"  ]]; then
+	##    Ans=Yes
+	##    break
+	##fi
+    ##done
+
+    ## NewWay
+    ## Just test ether card can found by ifconfig software.
+    /sbin/ifconfig $checketh &>/dev/null
+    if [ "$?" -eq "0" ]; then
+	Ans=Yes
+    fi
+
+    if [ "$Ans" == "Yes" ]; then
+	echo "Yes"
+    else
+	echo "No"
+    fi
+}
+
+# Check root file system format
+function CheckRootfs() {
+    local path ii file dir ChkDir Ans
+    Ans=''
+    path=$1
+    # Test /etc/fstab, group, nsswitch.conf, passwd
+    if [ ! -f $path/etc/fstab ] || [ ! -f $path/etc/group ] || [ ! -f $path/etc/nsswitch.conf ] || [ ! -f $path/etc/passwd ] ; then
+	Ans='No'
+    fi
+    
+    # Test rc*.d dir
+    dir='/etc/rc0.d /etc/rcS.d '
+    for ChkDir in $dir; do
+	if [ -d $path/$ChkDir ]; then
+	    files=($(find $path/etc/rc0.d/ -type l ))
+	    for ii in ${files[@]} ; do
+		file=$(readlink $ii |sed 's/..\/init.d\///g' )
+		if [ ! -f $path/etc/init.d/$file ]; then
+		    Ans='No'
+		fi
+	    done
+	else
+	    Ans='No'
+	fi
+    done
+    
+    if [ -z $Ans ]; then
+	Ans='Yes'
+    fi
+    echo $Ans
+
+}
+
+# Check Ip correct
+function CheckIpFormat() {
+    local len Ans ip ii
+    len=$(echo $1 |tr "." "\n" |wc -l)
+    if [ "$len" -eq "4" ]; then
+	ii=1
+	for ip in $(echo $1 |tr "." " "); do
+	    [[ $ip =~ ^[0-9]+$ ]] # IP addr is real number 
+	    if [ "$?" -ne "0" ]; then
+		Ans="No"
+		break
+	    fi
+	    # without ip = [255 0].*.*.[255 0]
+	    if [ "$ii" == "1" ]  || [ "$ii" == "4" ]; then
+		#  value <= 0 or value >= 255
+		if [ "$ip" -le 0 ] || [ "$ip" -ge 255 ] ; then
+		    Ans="No"
+		    break
+		else
+		    Ans="Yes"
+		fi
+
+	    else
+		# value < 0 or value >=255
+		if [ "$ip" -lt 0 ] || [ "$ip" -ge 255 ] ; then
+		    Ans="No"
+		    break
+		else
+		    Ans="Yes"
+		fi
+	    fi
+	    ii=$(( $ii + 1 ))
+	done
+    else
+	Ans="No"
+    fi
+    echo $Ans
+}
+# Transform NetMask
+function TransNetmask() {
+    local Mask mask ii jj number
+    ii=0
+    jj=32
+    Mask=$1
+    # According https://www.oav.net/mirrors/cidr.html web page for netmask transform
+    # Replace mask from number ( 1 - 32 ) to 255.255.255.255 
+    # Mask 25 == 255.255.255.128 # 128 == 2 ^ 7                    # Range 1 - 127, 129 - 254
+    # Mask 26 == 255.255.255.192 # 192 == 2 ^ 7 + 2 ^ 6            # Range 1 - 63, 65 - 127 , 129 - 191 , 193 - 254 
+    # Mask 27 == 255.255.255.224 # 192 == 2 ^ 7 + 2 ^ 6 + 2 ^ 5
+    # ...
+    # Mask 32 == 255.255.255.255 # 255 == 2 ^ 7 + ... + 2 ^ 0 
+    while [ "$jj" -gt "0" ]; do
+	if [ "$Mask" -ge "8" ]; then
+	    mask[$ii]=255
+	    Mask=$(( $Mask - 8 ))
+	else
+	    if [ "$Mask" -gt "0" ]; then
+		number=0
+		for ini in $(seq 7 -1 $(( 8 - $Mask ))); do
+		    number=$(( $number + 2**$ini ))
+		done
+		mask[$ii]=$number
+	    else
+		mask[$ii]="0"
+	    fi
+	    Mask="0"
+	fi
+	ii=$(( $ii + 1 ))
+	jj=$(( $jj - 8 ))
+    done
+    # Replace mask from range 0 - 32 to *.*.*.*
+    mask="${mask[0]}.${mask[1]}.${mask[2]}.${mask[3]}"
+    echo "$mask"
+    
+}
+# Check Net mode 
+function CheckNetMode() {
+    unset net ip Mode NeedShift
+    net=$1
+    ip=$(awk -F ',' '{print $1}' <<<$net)
+    Ans=$(CheckIpFormat $ip )
+    if [ "$Ans" == "Yes" ]; then
+	Mode="BaseNet"
+	NeedShift="No"
+    else
+	case "$1" in
+	    [oO][vV][sS])
+              Mode="OvsNet"
+	      NeedShift="Yes"
+	      ;;
+	    [mM][aA][cC][vV])
+              Mode="MacVNet"
+	      NeedShift="Yes"
+	      ;;
+	    [Bb][Aa][Ss][Ee])
+               Mode="BaseNet"
+	       NeedShift="Yes"
+	       ;;*)
+    esac
+
+    fi
+
+    if [ ! -z "$Mode" ]; then
+	echo $Mode $NeedShift
+    fi
+}
+
+# Check disk mode 
+function CheckDiskMode() {
+    unset disk Mode NeedShift
+    disk=$1
+    Ans=$(CheckImageFile $disk noerr)
+    if [ "$Ans" == "Yes" ]; then
+	# Old version using vda as default
+	#Mode="BaseStorage"
+	# New version using sda(scsi) as default
+	Mode="ScsiStorage"
+	NeedShift="No"
+    else
+	case "$1" in
+	    [sS][cC][sS][iI])
+              Mode="ScsiStorage"
+	      NeedShift="Yes"
+	      ;;
+	    [Bb][Aa][Ss][Ee])
+	       Mode="BaseStorage"
+	       NeedShift="Yes"
+	       ;;*)
+    esac
+
+    fi
+
+    if [ ! -z "$Mode" ]; then
+	echo $Mode $NeedShift
+    fi
+}
+# Check IP subnet
+function check-same-subnet() {
+    local ii ip ips Ans hostip hostmask hostips jj word mask checkip ip1 ip2 D2B ini HostMask HostIps hosteth IpNumbers gateway
+    checkip=$2
+    ips=($(egrep -o [0-9]+ <<< ${checkip} |tr "\n" " "))
+    case $1 in
+	subnet)
+
+            # Using Bitwise AND test for hostmask 
+            # test ip1 value == ip2 value 
+            # An eth card my have multi ip address, will loop to test it.
+
+            #Get host match eth card 
+            hosteth=$3
+
+	    #Get host ip match on eth card with route mark.
+	    HostIps=($(/sbin/ip addr show |grep inet |grep $hosteth |egrep -o 'inet [0-9]+.[0-9]+.[0-9]+.[0-9]+/[0-9]+' | sed 's/inet //g' ))
+	    #Get each host mask from host ip addr
+	    HostMask=($(echo ${HostIps[@]} |tr " " "\n" |awk -F '/' '{print $2}'))
+
+	    # Bitwise change function Range: 0 - 255 
+	    D2B=({0..1}{0..1}{0..1}{0..1}{0..1}{0..1}{0..1}{0..1})
+
+	    # Length with multi ip addr
+	    IpNumbers="${#HostIps[@]}"
+
+	    #Reset Ans to empty
+	    Ans=''
+
+	    # Checking SameSubnetP exist
+	    SameSubnetP=$(which SameSubnetP)
+	    if [ -z $SameSubnetP ]; then
+
+		for Len in $(seq 0 $((${IpNumbers} - 1 )) ); do
+
+		    # Loading each host mask and change ip format to array.
+		    hostmask=${HostMask[$Len]}
+		    hostips=($(egrep -o [0-9]+ <<< ${HostIps[$Len]} ))
+		    echo >&2 "Check same subnet between Guest:${ips[0]}.${ips[1]}.${ips[2]}.${ips[3]} and Host:${HostIps[$Len]} "
+		    ii=0
+		    jj=32
+		    mask=''
+		    mask=($(tr "." " " <<< $( TransNetmask $hostmask ) ))
+		    # when hostmask > 8 , match Check ip address and host ip address 
+		    # After Check ip address, 'hostmask - 8' and loop again
+		    # While hostmask < 8 , using binary value to check subnet
+		    # Change hostmask to range 0 - 255 by using 0+ 2 ^ 7 + ... + 2 ^ ( 8 - hostmask )
+		    # Creating mask, hostip and ips to binary code 
+		    # if mask = 1 , then check ips(0,1) == hostips(0,1) # Bitwise AND test 1 AND ( 1 , 0 ) == ( 1 ,0 )
+		    # if mask = 0 , do nothing # 0 AND ( 1 , 0 ) == 0
+		    # After check last hostmask < 8, jump out to loop
+
+		    while [ "$jj" -gt "0" ]; do
+	            # create mask bitwise value
+		    # last mask = 2 ^ 7 + ... + 2 ^ ( 8 - hostmask ) 
+		    # for example hostmask = 1, mask = 2 ^ 7 = 128 # hostmask = 2, mask= 2 ^ 7 + 2 ^ 6 = 192
+       	            # chnage ip value to binary value
+			if [ "${mask[$ii]}" == "255" ]; then
+			    ip1="${ips[$ii]}"
+			    ip2="${hostips[$ii]}"
+			    if [ ! "$ip1" == "$ip2" ]; then
+				# echo >&2 "IP1: $2 not match on subnet"
+				Ans='No'
+			    fi
+			elif [ "${mask[$ii]}" == "0" ];then
+			    break
+			else
+			    D2Bmask="${D2B[${mask[$ii]}]}"
+			    
+		            # ( ip1 AND mask ) == ( ip2 AND mask ) test
+			    for word in $(seq 1 8 ); do
+				netmaskword=$(cut -c $word <<< ${D2Bmask} )
+				if [ "$netmaskword" == "1" ]; then
+				    ip1test=$(cut -c $word <<< ${ip1} )
+				    ip2test=$(cut -c $word <<< ${ip2} )
+				    if [ "$ip1test" -ne "$ip2test" ]; then
+					# echo >&2 "Mask: ${mask[$ii]} not match between $ip1 and $ip2"
+					Ans='No'
+				    fi
+				fi
+			    done
+			fi
+
+			# ii means shift test value, jj means max netmask 32 
+			ii=$(( $ii + 1 ))
+			jj=$(( $jj - 8 ))
+		    done
+		    
+		    # Cause of multi ip address, Need to check Ans
+		    # If Ans == No and not the last one, Clean Ans value for another test
+		    if [ "$Ans" == "No" ] && [ "$Len" -lt "$((${IpNumbers} - 1 ))" ]; then
+			echo >&2 "Failed to match, test another host ip on same ether card "
+			echo >&2 " "
+			Ans=''
+		    else
+		    # If Ans =\= No , return gateway ip 
+			gateway=$(awk -F '/' '{print $1}' <<<${HostIps[$Len]})
+			mask=$( TransNetmask $hostmask )
+			echo >&2 "IP1 :$checkip IP2:${HostIps[$Len]} "
+			echo >&2 "Netmask:$mask "
+			break
+		    fi
+		done
+		
+	    else
+		# Test multi IP address
+		for Len in $(seq 0 $((${IpNumbers} - 1 )) ); do
+		    
+		    # Loading each host mask and change ip format to array.
+		    hostmask=${HostMask[$Len]}
+		    ii=0
+		    jj=32
+		    mask=''
+		    mask=$( TransNetmask $hostmask )
+		    ip2=$(awk -F '/' '{print $1}'  <<<${HostIps[$Len]})
+		    Return=$($SameSubnetP  $checkip $ip2 ${mask} ) # ip2 for hostip 
+		    echo >&2 ""
+		    if [ "x$Return" == "x0" ]; then
+			Ans='Yes'
+		    else
+			Ans='No'
+		    fi
+
+		    # If Ans == No and not the last one, Clean Ans value for another test
+		    if [ "$Ans" == "No" ] && [ "$Len" -lt "$((${IpNumbers} - 1 ))" ]; then
+			Ans=''
+		    else
+		    # If Ans =\= No , return gateway ip 
+			gateway=$(awk -F '/' '{print $1}' <<<${HostIps[$Len]})
+			break
+		    fi
+		done
+	    fi
+
+	    
+	    if ! [ "$Ans" == "No" ]; then
+		Ans="Yes"
+		echo $Ans $gateway $mask
+		echo >&2 "CheckIP: $2 match on Host subnet: ${HostIps[$Len]} "
+		echo >&2 " "
+	    fi
+
+	;;
+	private)
+	# 192.168.0.0 ip address
+	if [ "${ips[0]}" == "192" ] && [ "${ips[1]}" == "168" ]; then
+	    Ans=Yes
+	# 172.16.0.0 - 172.32.0.0 ip address
+	elif [ "${ips[0]}" == "172" ] && [  "${ips[1]}" -ge "16" ] && [ "${ips[1]}" -le "32"  ]; then
+	    Ans=Yes
+        # 10.0.0.0 ip address
+	elif [ "${ips[0]}" == "10" ]; then
+	    Ans=Yes
+	else
+	    Ans=No
+	fi
+	echo $Ans
+
+	;;*)
+	
+    esac
+    
+}
+
+# Random mac address
+function MacRandom() {
+    local prefix eth
+    eth=$1
+    # Macaddr=EthPrefix:Random
+    # EthPrefix=xx:xx:xx:
+    # Random using default RANDOM value to create random number and using md5sum to get random string
+
+    prefix=$(/sbin/ip addr show $eth |egrep -o "ether [0-9a-z]+:[0-9a-z]+:[0-9a-z]+:" |sed 's/ether //g')
+    random=$(md5sum <<<$RANDOM |sed 's/\(..\)\(..\)\(..\).*$/\1:\2:\3/g')
+    echo "$prefix$random"
+
+}
+# Load Image using nbd
+function SetupImage() {
+    local loopdev image 
+    case $1 in
+#Using nbd modules 
+	up-nbd)
+           loopdev=$3
+	   image=$2
+	   ${SUDO} modprobe nbd max_part=8
+	   ${SUDO} qemu-nbd --connect=${loopdev} $image &>/dev/null
+	   ls -l /dev/nbd0p* &>/dev/null
+	   if [ "$?" -ne "0" ]; then
+	       ${SUDO} partx -av ${loopdev} &>/dev/null
+	   fi   
+	;;
+
+	down-nbd)
+          loopdev=$2
+          ${SUDO} partx -dv ${loopdev} &>/dev/null
+          #${SUDO} losetup -d ${loopdev}
+	  ${SUDO} qemu-nbd --disconnect ${loopdev}
+	  ${SUDO} rmmod nbd 	
+	;;
+
+#Using losetup 
+	up)
+           loopdev=$3
+	   image=$2
+	   ${SUDO} losetup $loopdev $image
+	   ls -l ${loopdev}p* &>/dev/null
+	   if [ "$?" -ne "0" ]; then
+	       ${SUDO} partx -av ${loopdev} &>/dev/null
+	   fi   
+	;;
+	down)
+          loopdev=$2
+          ${SUDO} partx -dv ${loopdev} &>/dev/null
+          ${SUDO} losetup -d ${loopdev}
+	;;*)
+	
+    esac
+}
+# Check Image file
+function CheckImageFile() {
+    local image Ans Type test Ans
+    # Support link image 
+    test -L $1 &>/dev/null
+    if [ "$?" -eq "0" ]; then
+	image=$(readlink -f $1)
+    else
+	image=$1
+    fi
+    # data type for raw 
+    test=$(file $image |egrep -o data)
+    if [ "$test" == "data" ]; then
+	Ans="Yes"
+    fi
+    # block type for /dev/sd*
+    test=$(file $image |egrep -o block )
+    if [ "$test" == "block" ]; then
+	Ans="Yes"
+    fi
+    # Check file by fdisk
+    if [ "$Ans" == "Yes" ]; then
+	echo "Yes"
+    else
+	Type=$(${SUDO} fdisk -l $image 2>/dev/null |egrep -o "Disklabel type:.*$" |sed 's/Disklabel type: //g' ) 
+        # echo No if Ans is not Yes
+	# Partition table type : msdos, dos, gpt, loop 
+	case $Type in
+	    msdos)
+                 Ans="Yes"
+		 ;;
+	    dos)
+                 Ans="Yes"
+		 ;;
+            gpt)
+	         Ans="Yes"
+		 ;;
+            loop)
+	         Ans="Yes"
+		 ;;
+	    *)
+	         Ans="No"
+        esac
+	if [ "$Ans" == "Yes" ]; then
+	    echo "Yes"
+	else
+	    if [ ! "$2" == "noerr" ]; then
+		echo >&2 "Image: $image type not support."
+	    fi
+	    echo "No"
+	fi
+    fi
+}
+
+# Check Host and vm arch
+function ArchTest() {
+    local mode hostarch vmarch Ans 
+    mode=$1
+    hostarch=$2
+    if [ "$#" -eq "3" ]; then
+	vmarch=$3
+    fi
+    case $mode in
+	host)
+        # Test arm arch
+        egrep "[aA][rR][mM]" <<<$hostarch &>/dev/null
+	if [ "$?" -eq "0" ]; then
+	    Ans="Yes"
+	fi
+	# Test armv7l arch
+	egrep "[aA][rR][mM][vV]7[lL]" <<< $hostarch &>/dev/null
+	if [ "$?" -eq "0" ]; then
+	    Ans="Yes"
+	fi
+        # Test x86_64 arch
+        egrep "[xX]86_64" <<<$hostarch &>/dev/null
+	if [ "$?" -eq "0" ]; then
+	    Ans="Yes"
+	fi
+
+        # Test x86-64 arch
+        egrep "[xX]86-64" <<<$hostarch &>/dev/null
+	if [ "$?" -eq "0" ]; then
+	    Ans="Yes"
+	fi
+
+        # Test amd64 arch
+	egrep "[aA][mM][dD]64" <<<$hostarch &>/dev/null
+        if [ "$?" -eq "0" ]; then
+	    Ans="Yes"
+	fi
+	# Others arch
+	if [ "$Ans" == "Yes" ]; then
+	    echo "Yes"
+	else
+	    echo "No"
+
+	fi
+	;;
+	match)
+        # Test host is arm arch
+        egrep [aA][rR][mM] <<<$hostarch &>/dev/null
+	if [ "$?" -eq "0" ]; then
+	    # Test vm is arm arch
+	    egrep [aA][rR][mM] <<<$vmarch &>/dev/null
+            if [ "$?" -eq "0" ]; then
+		Ans="Yes"
+	    fi
+	fi
+
+	# Test armv7l arch
+	egrep "[aA][rR][mM][vV]7[lL]" <<< $hostarch &>/dev/null
+	if [ "$?" -eq "0" ]; then
+	    # Test vm is arm arch
+	    egrep [aA][rR][mM] <<<$vmarch &>/dev/null
+            if [ "$?" -eq "0" ]; then
+		Ans="Yes"
+	    fi
+	fi
+
+        # Test host is x86_64 arch
+        egrep [xX]86_64 <<<$hostarch &>/dev/null
+	if [ "$?" -eq "0" ]; then
+	    # Test vm is arm arch
+	    egrep [aA][rR][mM] <<<$vmarch &>/dev/null
+            if [ "$?" -eq "0" ]; then
+		Ans="Yes"
+	    fi
+	    # Test vm is x86_64 arch
+	    egrep [xX]86_64 <<<$vmarch &>/dev/null
+            if [ "$?" -eq "0" ]; then
+		Ans="Yes"
+	    fi
+	    # Test vm is x86-64 arch
+	    egrep [xX]86-64 <<<$vmarch &>/dev/null
+            if [ "$?" -eq "0" ]; then
+		Ans="Yes"
+	    fi
+	    # Test vm is amd64 arch
+	    egrep [aA][mM][dD]64 <<<$vmarch &>/dev/null
+            if [ "$?" -eq "0" ]; then
+		Ans="Yes"
+	    fi
+	fi
+
+        # Test host is x86-64 arch
+        egrep [xX]86-64 <<<$hostarch &>/dev/null
+	if [ "$?" -eq "0" ]; then
+	    # Test vm is arm arch
+	    egrep [aA][rR][mM] <<<$vmarch &>/dev/null
+            if [ "$?" -eq "0" ]; then
+		Ans="Yes"
+	    fi
+	    # Test vm is x86_64 arch
+	    egrep [xX]86_64 <<<$vmarch &>/dev/null
+            if [ "$?" -eq "0" ]; then
+		Ans="Yes"
+	    fi
+	    # Test vm is x86-64 arch
+	    egrep [xX]86-64 <<<$vmarch &>/dev/null
+            if [ "$?" -eq "0" ]; then
+		Ans="Yes"
+	    fi
+	    # Test vm is amd64 arch
+	    egrep [aA][mM][dD]64 <<<$vmarch &>/dev/null
+            if [ "$?" -eq "0" ]; then
+		Ans="Yes"
+	    fi
+	fi
+
+        # Test host is amd64 arch
+        egrep [aA][mM][dD]64 <<<$hostarch &>/dev/null
+	if [ "$?" -eq "0" ]; then
+	    # Test vm is arm arch
+	    egrep [aA][rR][mM] <<<$vmarch &>/dev/null
+            if [ "$?" -eq "0" ]; then
+		Ans="Yes"
+	    fi
+	    # Test vm is x86_64 arch
+	    egrep [xX]86_64 <<<$vmarch &>/dev/null
+            if [ "$?" -eq "0" ]; then
+		Ans="Yes"
+	    fi
+	    # Test vm is amd64 arch
+	    egrep [aA][mM][dD]64 <<<$vmarch &>/dev/null
+            if [ "$?" -eq "0" ]; then
+		Ans="Yes"
+	    fi
+	fi
+
+	# Other host
+	if [ "$Ans" == "Yes"  ]; then
+	    echo "$Ans"
+	else
+	    echo "No"
+
+	fi
+	;;
+    esac
+}
+
+# Get arch tag
+function ArchTag() {
+    local mode arch init file realfile arch
+    file=$1
+    arch=$( objdump -x $file 2>/dev/null |egrep architecture |awk -F ',' '{print $1}'| tr " " "\n" |sed '1d' )
+
+    # Test arch is unknow
+    egrep "UNKNOWN" <<<$arch &>/dev/null
+    if [ "$?" -eq "0" ]; then
+	if [ -L $file ]; then
+	    file=$(readlink -f $file )
+	fi
+	arch=$(file $file |awk -F ',' '{print $2}' |sed 's/ //g')
+    fi
+    
+    # Test arch is arm arch
+    egrep [aA][rR][mM] <<<$arch &>/dev/null
+    if [ "$?" -eq "0" ]; then
+	echo "ARM"
+	# Test arch is arm64 arch
+	egrep [aA][aA][rR][cC][hH] <<< $arch &>/dev/null
+	if [ "$?" -eq "0" ]; then
+	    return 64
+	else
+	    return 32
+	fi
+    fi
+
+    # Test arch is x86_64 arch
+    egrep [xX]86_64 <<<$arch &>/dev/null
+    if [ "$?" -eq "0" ]; then
+	echo "x86_64"
+    fi
+
+    # Test arch is x86-64 arch
+    egrep [xX]86-64 <<<$arch &>/dev/null
+    if [ "$?" -eq "0" ]; then
+	echo "x86_64"
+    fi
+
+    # Test arch is amd64 arch
+    egrep [aA][mM][dD]64 <<<$arch &>/dev/null
+    if [ "$?" -eq "0" ]; then
+	echo "x86_64"
+    fi
+
+}
+
+
+# Create partition for Nfs loacl disk
+function CreatePartition() {
+    local image loopdev etc var home tmp
+    image=$1
+    # Create four quarters partition 
+    ${SUDO} parted -s $image mktable msdos 
+    ${SUDO} parted $image mkpart primary 0% 25%
+    ${SUDO} parted $image mkpart primary 25% 50%
+    ${SUDO} parted $image mkpart primary 50% 75%
+    ${SUDO} parted $image mkpart primary 75% 100%
+    # Using nbd to format partition 
+    loopdev="/dev/nbd0"
+    ${SUDO} modprobe nbd max_part=8
+    ${SUDO} qemu-nbd --connect=${loopdev} $image &>/dev/null
+    ls -l /dev/nbd0p* &>/dev/null
+    if [ "$?" -ne "0" ]; then
+	${SUDO} partx -av ${loopdev} &>/dev/null
+    fi
+    ${SUDO} mkfs.ext4 ${loopdev}p${etcnum} -L etc  &>/dev/null
+    ${SUDO} mkfs.ext4 ${loopdev}p${varnum} -L var  &>/dev/null
+    ${SUDO} mkfs.ext4 ${loopdev}p${homenum} -L home &>/dev/null
+    ${SUDO} mkfs.ext4 ${loopdev}p${tmpnum} -L tmp  &>/dev/null
+    ${SUDO} partx -dv ${loopdev} &>/dev/null
+    #${SUDO} losetup -d ${loopdev}
+    ${SUDO} qemu-nbd --disconnect ${loopdev}
+    sleep 1
+    ${SUDO} rmmod nbd 
+
+
+}
+
+# Guest network interface
+function GuestInterface() {
+    local IP NETMASK GW ETH
+    IP=$2
+    MASK=$4
+    ETH=$3
+    case $1 in
+	new)
+    cat<<EOF>interface
+# Local loopback
+auto lo
+iface lo inet loopback
+
+allow-hotplug $ETH
+iface $ETH inet static
+	address $IP
+EOF
+    if [ ! -z $MASK ]; then
+       echo "	netmask $MASK">>interface
+    fi
+
+    if [ "$CheckGW" == "Yes" ]; then
+	echo "	gateway $GW0" >>interface
+    fi
+
+	;;
+	add)
+cat<<EOF>>interface	
+allow-hotplug $ETH
+iface $ETH inet static
+	address $IP
+EOF
+    if [ ! -z $MASK ]; then
+       echo "	netmask $MASK">>interface
+    fi
+
+	;;*)
+	
+    esac
+
+}
+
+# Replace fstab
+function ReplaceFstab() {
+    local etc etcf var varf home homef tmp tmpf
+    # Loading each parition number 
+    etc=$(sed 's/\/dev\/loop[0-9]p//g' <<<$1)
+    etcf=$(${SUDO} parted ${LOOPDEV} print  |egrep -o "^ ${etc}+.*$" |awk -F ' ' '{print $6}')
+    var=$(sed 's/\/dev\/loop[0-9]p//g' <<<$2)
+    varf=$(${SUDO} parted ${LOOPDEV} print  |egrep -o "^ ${etc}+.*$" |awk -F ' ' '{print $6}')
+    home=$(sed 's/\/dev\/loop[0-9]p//g' <<<$3)
+    homef=$(${SUDO} parted ${LOOPDEV} print  |egrep -o "^ ${etc}+.*$" |awk -F ' ' '{print $6}')
+    tmp=$(sed 's/\/dev\/loop[0-9]p//g' <<<$4)
+    tmpf=$(${SUDO} parted ${LOOPDEV} print  |egrep -o "^ ${etc}+.*$" |awk -F ' ' '{print $6}')
+cat<<EOF>fstab
+# /etc/fstab: static file system information.
+#
+# Use 'blkid' to print the universally unique identifier for a
+# device; this may be used with UUID= as a more robust way to name devices
+# that works even if disks are added and removed. See fstab(5).
+#
+# <file system> <mount point>   <type>  <options>       <dump>  <pass>
+# / was on /dev/sda2 during installation
+/dev/${PreFixDisk}a$etc          /etc          $etcf    defaults          0       2
+/dev/${PreFixDisk}a$var          /var          $varf    defaults          0       2
+/dev/${PreFixDisk}a$home          /home        $homef    defaults          0       2
+/dev/${PreFixDisk}a$tmp	   /tmp		 $tmpf   defaults          0       2
+EOF
+    
+}
+
+# Replace guest hostname
+function ReplaceHostname() {
+    local hostname hosts name filepath
+    name=$2
+    filepath=$3
+    case $1 in
+	hosts)
+            # ${SUDO} cp /etc/hosts hosts
+	    sed -i "s/127.0.0.1 .*$/127.0.0.1   localhost $name/g" hosts
+	    sed -i "s/::1 .*$/::1   localhost $name ip6-localhost ip6-loopback/g" hosts
+	    ${SUDO} mv hosts ${filepath}
+	    ;;
+	hostname)
+	    ${SUDO} /bin/bash -c "echo \"${name}\" >${filepath}"
+	;;*)
+	
+    esac
+}
+
+# Replace guest 02-scp
+function ReflashInitrd() {
+    local VMPATH
+    VMPATH=$1
+    cat<<EOF>02-scp
+#!/bin/bash
+# Update uInitrd
+echo "update-initramfs: Copy initrd.img to host" >&2
+INITRD="/boot/initrd.img-\$1"
+if [ -L /boot/zImage ]; then
+    ZIMAGE=\$(readlink -f /boot/zImage )
+    INITRD=\$(sed 's/vmlinuz/initrd.img/g' <<<\$ZIMAGE)
+else
+    ZIMAGE="/boot/vmlinuz-\$1"
+fi
+scp \${INITRD} $(whoami)@${HOSTIP}:${VMPATH}/initrd.img.new
+scp \${ZIMAGE} $(whoami)@${HOSTIP}:${VMPATH}/zImage.new
+exit 0
+
+EOF
+chmod +x 02-scp
+}
+
+# Replace guest rc.local
+function ReplaceRclocal() {
+    local gw hostip ethcard ii
+    hostip=$1
+    # Base rc.local file 
+    if [ -f ../DebianNetFiles/rc.local ]; then
+	cp ../DebianNetFiles/rc.local rc.local
+    else
+	cat<<EOF>rc.local
+#!/bin/sh -e
+#
+# rc.local
+#
+# This script is executed at the end of each multiuser runlevel.
+# Make sure that the script will "exit 0" on success or any other
+# value on error.
+#
+# In order to enable or disable this script just change the execution
+# bits.
+#
+# By default this script does nothing.
+EOF
+
+    fi
+
+    echo "hostname ${GUESTNAME}" >>rc.local
+    if [ "${VMARCH}" == "ARM" ]; then
+	echo "if [ -f /etc/init.d/qemu-guest-agent ]; then " >> rc.local
+	echo "  /etc/init.d/qemu-guest-agent stop" >>rc.local
+	echo "  /usr/sbin/qemu-ga -m virtio-serial -p /dev/virtio-ports/qemu.guest_agent.0 --daemon" >>rc.local
+	echo "fi " >> rc.local
+    fi
+    if [ "${HOSTARCH}" == "${VMARCH}" ]; then
+	echo "mount -t 9p -o trans=virtio,version=9p2000.L usr-local /usr/local/ -r " >>rc.local
+    fi
+    if [ "${MultiShareDir}" == "Yes" ]; then
+	for ii in $(seq 0 ${ShareLen}); do
+	    echo "mount -t 9p -o trans=virtio,version=9p2000.L ${ShareName[$ii]} ${ShareMount[$ii]} -r " >>rc.local
+	done
+    fi
+    
+    if [ "$CheckGW" == "No" ]; then
+	echo "route add -host $hostip dev eth0 " >>rc.local
+	echo "route add default gw $GW0 " >>rc.local
+    fi
+    echo "exit 0" >>rc.local
+}
+
+# Create Base script
+function CreateBaseScript() {
+    local start stop mode file
+    mode=$1
+    file=$2
+    cat<<EOF>${file}
+#!/bin/bash
+# Don't Edit, File automatically generated by Config-KVM script
+if [ \$EUID -ne 0 ]
+   then sudo echo "Super User passwd, please:"
+        if [ \$? -ne 0 ]
+          then  echo "Sorry, need su privilege!"
+                exit 1
+        fi
+fi
+
+NETWORK_DIR="../network-${GUESTNAME}"
+NAME="${GUESTNAME}"
+PID="../data/${GUESTNAME}.pid" ##PID file for QEMU
+if [ ! -d ../data ]; then
+    echo "No data directory, create new."
+    mkdir -p ../data
+fi
+EOF
+
+    if [ "${HOSTARCH}" == "ARM" ]; then
+	mod="virtio_net virtio_blk virtio_mmio virtio_scsi 9p"
+    else
+	mod="vhost_net virtio_net virtio_blk virtio_scsi 9p"
+    fi
+
+    case $mode in
+	start)
+	cat << EOF >> ${file}
+MOD="${mod}"
+MEM='512M'
+mkdir -p \${NETWORK_DIR}
+##Turn on the vhost
+for mod in \${MOD};do
+    sudo modprobe \${mod}
+done
+
+##CHMOD /dev/kvm, /dev/vhost-net
+if [ -c /dev/kvm ]; then
+    sudo chmod 666 /dev/kvm
+fi
+
+if [ -c /dev/vhost-net ]; then
+    sudo chmod 666 /dev/vhost-net 
+fi
+EOF
+
+# Add update kernel script into base start script
+
+          if [ "$VMARCH" == "ARM" ]; then
+	      case "$ROOTFSTYPE" in
+		  "BASE")
+	      cat << EOF >> ${file}
+##Update kernel if there has new version
+if [ -f ../Kernel/\${NAME}/zImage.new ] && [ -f ../Kernel/\${NAME}/initrd.img.new ]; then
+    echo "Found new kernel version, will update kernel. "
+    if [ -f ../Kernel/\${NAME}/zImage.old ]; then
+	echo "Found old kernel version, will clean it." 
+	rm ../Kernel/\${NAME}/zImage.old
+    fi
+    if [ -f ../Kernel/\${NAME}/initrd.img.old ]; then
+	echo "Found old initramfs version, will clean it." 
+	rm ../Kernel/\${NAME}/initrd.img.old
+    fi
+    # Move newer as default kernel version and backup old kernel version
+    mv ../Kernel/\${NAME}/zImage  ../Kernel/\${NAME}/zImage.old
+    mv ../Kernel/\${NAME}/zImage.new  ../Kernel/\${NAME}/zImage
+    # Move newer as default kernel version and backup old kernel version
+    mv ../Kernel/\${NAME}/initrd.img  ../Kernel/\${NAME}/initrd.img.old
+    mv ../Kernel/\${NAME}/initrd.img.new  ../Kernel/\${NAME}/initrd.img
+    echo -ne "Finsh update kernel!\n"
+fi
+
+EOF
+		  
+		  ;;
+		  "NFS")
+	      cat << EOF >> ${file}
+##Update kernel if there has new version
+if [ -f ../Kernel/${NFSdir}/zImage.new ] && [ -f ../Kernel/${NFSdir}/initrd.img.new ]; then
+    echo "Found new kernel version, will update kernel. "
+    if [ -f ../Kernel/${NFSdir}/zImage.old ]; then
+	echo "Found old kernel version, will clean it." 
+	rm ../Kernel/${NFSdir}/zImage.old
+    fi
+    if [ -f ../Kernel/${NFSdir}/initrd.img.old ]; then
+	echo "Found old initramfs version, will clean it." 
+	rm ../Kernel/${NFSdir}/initrd.img.old
+    fi
+    # Move newer as default kernel version and backup old kernel version
+    mv ../Kernel/${NFSdir}/zImage  ../Kernel/${NFSdir}/zImage.old
+    mv ../Kernel/${NFSdir}/zImage.new  ../Kernel/${NFSdir}/zImage
+    # Move newer as default kernel version and backup old kernel version
+    mv ../Kernel/${NFSdir}/initrd.img  ../Kernel/${NFSdir}/initrd.img.old
+    mv ../Kernel/${NFSdir}/initrd.img.new  ../Kernel/${NFSdir}/initrd.img
+    echo -ne "Finsh update kernel!\n"
+fi
+
+EOF
+                ;;
+		  *)
+		  
+	      esac
+    
+	  fi
+# Add vhost change
+        cat << 'EOF' >> ${file}
+## Replace cpu core and memory usage for VM.
+case $1 in
+    vhoston)
+          echo "Turn on vhost "
+          oldstatus=off
+          newstatus=on
+	  sed -i "s/vhost=$oldstatus/vhost=$newstatus/g" $0
+	  exit 0
+	    ;;
+    vhostoff)
+          echo "Turn off vhost "
+          oldstatus=on
+          newstatus=off
+	  sed -i "s/vhost=$oldstatus/vhost=$newstatus/g" $0
+	  exit 0
+    ;;*)
+	  echo "If you want to change vhost status, you can using this command line to change."
+          echo "Turn off vhost usage: $0 vhostoff"
+          echo "Turn on vhost usage: $0 vhoston"
+          egrep vhost <<< $0 |grep vhost |grep on &>/dev/null
+          if [ "$?" -eq "0" ]; then
+	    echo "Vhost status: on"
+	    sudo modprobe vhost_net
+	  else
+	    echo "Vhost status: off"
+	    sudo modprobe -r vhost_net
+	    sudo modprobe -r vhost
+	    
+	  fi
+esac
+EOF
+	;;
+	stop)
+	if [ "$VMARCH" == "ARM" ]; then
+	    cat<<EOF>>${file}
+### Stop by socat 
+# Using qemu guest agent 
+echo "Shutdown VM by QEMU GUEST AGENT"
+if [ -S \${NETWORK_DIR}/qga.sock ]; then
+    echo \{\"execute\":\"guest-shutdown\"\} |socat unix-connect:\${NETWORK_DIR}/qga.sock -
+    echo "Please wait 20 seconds."
+    sleep 20
+else
+    echo "Socket has been removed! Shutdown by monitor socat."
+fi
+
+EOF
+	fi
+	cat<<EOF>>${file}
+# Using monitor 
+echo "Shutdown VM by ACPI MONITOR"
+if [ -S \${NETWORK_DIR}/MonSock ]; then
+    echo "system_powerdown" | socat - unix-connect:\${NETWORK_DIR}/MonSock
+    echo "Please wait 20 seconds."
+    sleep 20
+else
+    echo "Socket has been removed! Shutdown by ssh."
+fi
+
+### Stop by ssh 
+ping -c 3 ${IP[0]}
+if [ "\$?" -eq "0"  ]; then
+    echo "VM name : \${NAME} still alive, shut it down. Using ssh connect to shutdown"
+    ssh -t $(whoami)@${IP[0]} -t "sudo init 0"
+    echo "Please wait 20 seconds. "
+    sleep 20
+else
+    echo "VM name : \${NAME} cannot connect, start to check qemu pid."
+fi
+EOF
+cat<<"EOF">>${file}
+### stop by screen
+
+if [ -f ${PID} ];then
+    echo -e "Check QEMU pid : $(sudo cat ${PID} )"
+    ps -p $(sudo cat ${PID} )
+    if [ "$?" -eq "0" ];then
+        echo "Check VM screen status."
+        if [ $(screen -ls |grep ached |awk -F ' ' '{print $1}'|awk -F '.' '{print $2}'|grep "^${NAME}$"|wc -l) == "1" ]; then
+            ## Check screnn as Detached
+            if [ $(screen -ls |grep ached |grep Detached|awk -F ' ' '{print $1}'|awk -F '.' '{print $2}'|grep "^${NAME}$"|wc -l) == "1" ];then
+                echo "Start to shutdown by screen. "
+            else
+                echo "Some one using screen Attached, start logout screen user."
+                screen -D ${NAME}
+            fi
+            ## Start to shutdown by screen
+            screen -r ${NAME} -X stuff "init 0 $(printf \\r)"
+            echo "Wait for 20 seconds"
+            sleep 20
+        else
+            echo " VM running screen not found, start forcing shutdown. "
+        fi
+    fi
+
+###  force Stop VM
+    echo -e "Check QEMU pid again."
+    ps -p $(sudo cat ${PID} )
+    if [ "$?" -eq "0" ];then
+        echo -ne "VM still running, force stop VM\n"
+        sudo kill -9 `sudo cat ${PID}`
+        sudo rm ${PID}
+        echo -ne "\n\e[1;49;91mShutdown VM via "kill -9 $PID", VM rootfs may be damaged.\nPlease check VM name : ${NAME} in the foreground.\n  \e[m"
+    else
+        echo -ne "\e[1;49;32mVM shuttdown succeed, clean PID file.\n\e[m"
+        sudo rm ${PID}
+    fi
+else
+    echo -ne "\e[1;49;32mPid file not exist, VM shutdown.\n\e[m"
+fi
+EOF
+	;;*)
+	
+    esac
+}
+
+# Create guest net in host 
+function CreateVmnetInHost() {
+    local netmode mode tap ip eth ips file
+    netmode=$1
+    mode=$2
+    ip=$3
+    tap=$4
+    eth=$5
+    mac=$6
+    file=$7
+    case $netmode in
+	BaseNet)
+	case $mode in
+	    startnew)
+	    ips=$(egrep -o "[0-9]+.[0-9]+.[0-9]+."<<<${ip})0/${HOSTMASK[0]}
+	    cat<<EOF>> ${file}
+echo -e "Starting basic network setting ..."
+# First net card
+sudo sysctl net.ipv4.ip_forward=1
+sudo tunctl -u `whoami` -t ${tap}
+sudo ifconfig ${tap} ${HOSTIP} netmask ${HOSTMASK} up
+sudo iptables --table nat -A POSTROUTING --out-interface $eth -s $ips -j MASQUERADE
+sudo iptables -A FORWARD --in-interface ${tap} -j ACCEPT
+sudo arp -Ds ${ip} ${eth} pub
+echo -e "VM IP: ${ip}"
+sudo sysctl net.ipv4.conf.${tap}.proxy_arp=1
+sudo route add -host ${ip} dev ${tap}
+vde_switch -mod 644 -sock=\${NETWORK_DIR}/vde0 -mgmt \${NETWORK_DIR}/vde_switch0.mgmt -daemon </dev/null >/dev/null
+EOF
+	    ;;
+	    startadd)
+	    ips=$(egrep -o "[0-9]+.[0-9]+.[0-9]+."<<<${ip})0/${HOSTMASK[$ii]}
+	    cat<<EOF>> ${file}
+# Another net card
+sudo tunctl -u `whoami` -t ${tap}
+sudo ifconfig ${tap} ${HOSTIP[$ii]} netmask ${HOSTMASK[$ii]} up
+sudo iptables --table nat -A POSTROUTING --out-interface $eth -s $ips -j MASQUERADE
+sudo iptables -A FORWARD --in-interface ${tap} -j ACCEPT
+echo -e "VM others IP: ${ip}"
+sudo arp -Ds ${ip} ${eth} pub
+sudo sysctl net.ipv4.conf.${tap}.proxy_arp=1
+sudo route add -host ${ip} dev ${tap}
+vde_switch -mod 644 -sock=\${NETWORK_DIR}/vde$ii -mgmt \${NETWORK_DIR}/vde_switch$ii.mgmt -daemon </dev/null >/dev/null
+EOF
+	    
+	    ;;
+	    stopnew)
+	    ips=$(egrep -o "[0-9]+.[0-9]+.[0-9]+."<<<${ip})0/${HOSTMASK[0]}
+	    cat<<EOF>>${file}
+# Another Net reset
+echo "Stopping switch lan " 
+sudo iptables --table nat -D POSTROUTING --out-interface $eth -s $ips -j MASQUERADE
+sudo iptables -D FORWARD --in-interface ${tap} -j ACCEPT
+sudo pkill -f "vde_switch -mod 644 -sock=\${NETWORK_DIR}/vde0 -mgmt \${NETWORK_DIR}/vde_switch0.mgmt -daemon"
+sudo ifconfig ${tap} 0 
+sudo ifconfig ${tap} down
+sudo sysctl net.ipv4.conf.${tap}.proxy_arp=0
+sudo ip link del ${tap}
+sudo tunctl -d ${tap}
+
+EOF
+	    ;;
+	    stopadd)
+	    ips=$(egrep -o "[0-9]+.[0-9]+.[0-9]+."<<<${ip})0/${HOSTMASK[$ii]}
+	    cat<<EOF>>${file}
+sudo iptables --table nat -D POSTROUTING --out-interface $eth -s $ips -j MASQUERADE
+sudo iptables -D FORWARD --in-interface ${tap} -j ACCEPT
+sudo pkill -f "vde_switch -mod 644 -sock=\${NETWORK_DIR}/vde$ii -mgmt \${NETWORK_DIR}/vde_switch$ii.mgmt -daemon"
+sudo ifconfig ${tap} 0
+sudo ifconfig ${tap} down
+sudo sysctl net.ipv4.conf.${tap}.proxy_arp=0
+sudo ip link del ${tap}
+sudo tunctl -d ${tap}
+EOF
+	esac
+	;;
+	MacVNet)
+	case $mode in
+	    startnew)
+	    ips=$(egrep -o "[0-9]+.[0-9]+.[0-9]+."<<<${ip})0/${HOSTMASK[0]}
+	    cat<<EOF>> ${file}
+echo -e "Starting basic network setting ..."
+# First net card
+if /sbin/ifconfig tapv$eth &>/dev/null; then
+    echo -e "Already created, add VM IP into routing table"
+else
+    echo -e "Create tapv$eth interface for host connected."
+    sudo ip link add link $eth name tapv$eth type macvlan mode bridge
+    sudo ifconfig tapv$eth ${HOSTIP} netmask ${HOSTMASK} up
+
+fi
+echo -e "VM IP: ${ip}"
+sudo ip link add link $eth name $tap address $mac type macvtap mode bridge
+sleep 2
+sudo ip link set dev $tap up
+sudo route add -host ${ip} dev tapv$eth
+tapnum0=\$(cat /sys/class/net/$tap/ifindex)
+sudo chmod 666 /dev/tap\$tapnum0
+
+EOF
+	    ;;
+	    startadd)
+	    ips=$(egrep -o "[0-9]+.[0-9]+.[0-9]+."<<<${ip})0/${HOSTMASK[$ii]}
+	    cat<<EOF>> ${file}
+# Another net card
+echo -e "VM IP: ${ip}"
+sudo ip link add link $eth name $tap address $mac type macvtap mode bridge
+sleep 2
+sudo ip link set dev $tap up
+tapnum$ii=\$(cat /sys/class/net/$tap/ifindex)
+sudo chmod 666 /dev/tap\$tapnum$ii
+
+EOF
+	    
+	    ;;
+	    stopnew)
+	    ips=$(egrep -o "[0-9]+.[0-9]+.[0-9]+."<<<${ip})0/${HOSTMASK[0]}
+	    cat<<EOF>>${file}
+# First Net reset
+echo "Stopping switch lan $tap" 
+if [ -d /proc/sys/net/ipv4/conf/$tap ]; then
+    sudo route delete -host ${ip} dev tapv$eth
+    sudo ip link set dev $tap down
+    sudo ip link delete $tap
+fi
+
+# Clean macvlan
+echo "Check macvlan status"
+Ans=\$(/sbin/route -n |grep tapv$eth |sed '/${HOSTMASK}/d' |wc -l )
+if [ "\$Ans" == "0" ]; then
+    echo "All VM are not use this macvlan, start remove it."
+    sudo ifconfig tapv$eth 0 down
+    sleep 2
+    sudo ip link set tapv$eth down
+    sudo ip link del tapv$eth
+else
+    echo "Other VM are used, will not remove macvlan."
+
+fi
+EOF
+	    ;;
+	    stopadd)
+	    ips=$(egrep -o "[0-9]+.[0-9]+.[0-9]+."<<<${ip})0/${HOSTMASK[$ii]}
+	    cat<<EOF>>${file}
+echo "Stopping switch lan $tap" 
+if [ -d /proc/sys/net/ipv4/conf/$tap ]; then
+    sudo ip link set dev $tap down
+    sudo ip link delete $tap
+fi
+EOF
+	esac
+	;;
+	*)
+	
+    esac
+}
+
+
+
+function CreateQemuScript() {
+    local ip tap eth disk mac num
+    case $1 in
+	base)
+	    if [ "${VMARCH}" == "ARM" ]; then
+		# Running on ARM SBC, CPU using host's CPU
+		if [ "${HOSTARCH}" == "ARM" ]; then
+		    echo "$QEMUSystem -M virt -cpu host -enable-kvm -m \${MEM} -smp 1 -serial stdio "
+		else
+		    if [ "a$CPUMode" == "a" ]; then
+			# Running on x86 base PC, CPUMode not setting, using default CPU.
+			echo "$QEMUSystem -M virt -m \${MEM} -smp 1 -serial stdio "
+			
+		    else
+			# Running on x86 base PC with CPUMode
+			echo "$QEMUSystem -M virt -cpu $CPUMode -m \${MEM} -smp 1 -serial stdio "
+			
+		    fi
+		fi
+	    else
+		echo "kvm -m \${MEM} -smp 1 "
+	    fi
+	;;
+	kernel)
+	echo "-initrd ../Kernel/${GUESTNAME}/initrd.img  -kernel ../Kernel/${GUESTNAME}/zImage "
+	;;
+	monitor)
+	echo "-monitor unix:\${NETWORK_DIR}/MonSock,server,nowait "
+	;;
+	guestagent)
+	echo "-device virtio-serial-device -device virtserialport,chardev=qga0,name=qemu.guest_agent.0 -chardev socket,path=\${NETWORK_DIR}/qga.sock,server,nowait,id=qga0 "
+	;;
+	sharedfile)
+	    case $2 in
+		base)
+		    if [ "${HOSTARCH}" == "ARM" ]; then
+			echo "-fsdev local,security_model=passthrough,id=fsdev0,path=/usr/local -device virtio-9p-device,fsdev=fsdev0,mount_tag=usr-local "
+		    else
+			if [ "${VMARCH}" == "ARM" ]; then
+			    echo ""
+			else
+			    echo "-fsdev local,security_model=passthrough,id=fsdev0,path=/usr/local -device virtio-9p-pci,fsdev=fsdev0,mount_tag=usr-local "
+			    
+			fi
+		    fi
+
+		    ;;
+		add)
+		    num=$3
+		    dir=$4
+		    name=$5
+		    
+		    if [ "${HOSTARCH}" == "ARM" ]; then
+			echo "-fsdev local,security_model=passthrough,id=fsdev${num},path=$dir -device virtio-9p-device,fsdev=fsdev${num},mount_tag=${name} "
+		    else
+			if [ "${VMARCH}" == "ARM" ]; then
+			    echo "-fsdev local,security_model=passthrough,id=fsdev${num},path=$dir -device virtio-9p-device,fsdev=fsdev${num},mount_tag=${name} "
+			    
+			else
+			    echo "-fsdev local,security_model=passthrough,id=fsdev${num},path=$dir -device virtio-9p-pci,fsdev=fsdev${num},mount_tag=${name} "
+			    
+			fi
+		    fi
+
+		    ;;
+		*)
+		    
+	    esac
+	;;
+	
+	net)
+	    mac=$2
+	    tap=$3
+	    seq=$(( 3 + $4 ))
+	    case $NetMode in
+		BaseNet)
+	          if [ "${HOSTARCH}" == "ARM" ]; then
+		      echo " -net vde,sock=\${NETWORK_DIR}/vde$ii -netdev type=tap,id=hostnet$ii,ifname=${tap},script=no,vhost=off -device virtio-net-device,netdev=hostnet$ii,mac=${mac} "
+		  else
+		      if [ "${VMARCH}" == "ARM" ]; then
+			  echo " -net vde,sock=\${NETWORK_DIR}/vde$ii -netdev type=tap,id=hostnet$ii,ifname=${tap},script=no,vhost=off -device virtio-net-device,netdev=hostnet$ii,mac=${mac} "
+		      else
+			  echo " -net vde,sock=\${NETWORK_DIR}/vde$ii -netdev type=tap,id=hostnet$ii,ifname=${tap},script=no,vhost=on -device virtio-net-pci,netdev=hostnet$ii,mac=${mac} "
+		      fi
+		  fi
+		
+		;;
+		MacVNet)
+	          if [ "${HOSTARCH}" == "ARM" ]; then
+		      echo " -netdev type=tap,fd=$seq,id=hostnet$ii,vhost=off $seq<>/dev/tap\$tapnum$ii -device virtio-net-device,netdev=hostnet$ii,mac=${mac} "
+		  else
+		      if [ "${VMARCH}" == "ARM" ]; then
+			  echo " -netdev type=tap,fd=$seq,id=hostnet$ii,vhost=off $seq<>/dev/tap\$tapnum$ii -device virtio-net-device,netdev=hostnet$ii,mac=${mac} "
+		      else
+			  echo " -netdev type=tap,fd=$seq,id=hostnet$ii,vhost=on $seq<>/dev/tap\$tapnum$ii -device virtio-net-pci,netdev=hostnet$ii,mac=${mac} "
+		      fi
+		  fi
+		  
+		;;*)
+		
+	    esac
+	    
+	    ;;
+	disk)
+	    disk=$2
+	    case "${ROOTFSTYPE}" in
+		NFS)
+		    num=$(($ii - 1 ))
+		    case $DiskMode in
+			BaseStorage)
+		           if [ "$num" -ge "0" ]; then
+			       if [ "${HOSTARCH}" == "ARM" ]; then
+				   echo "-drive if=none,id=hdd${num},file=${disk},format=raw -device virtio-blk-device,drive=hdd${num} "
+			       else
+				   if [ "${VMARCH}" == "ARM" ]; then
+				       echo "-drive if=none,id=hdd${num},file=${disk},format=raw -device virtio-blk-device,drive=hdd${num} "
+				       
+				   else
+				       echo "-drive if=none,id=hdd${num},file=${disk},format=raw -device virtio-blk-pci,drive=hdd${num} "
+				       
+				   fi
+			       fi
+			   fi
+			   
+			;;
+			ScsiStorage)
+		           if [ "$num" -ge "0" ]; then
+			       if [ "${HOSTARCH}" == "ARM" ]; then
+				   echo "-drive if=none,id=hdd${num},file=${disk},format=raw -device scsi-hd,drive=hdd${num} "
+			       else
+				   if [ "${VMARCH}" == "ARM" ]; then
+				       echo "-drive if=none,id=hdd${num},file=${disk},format=raw -device scsi-hd,drive=hdd${num} "
+				       
+				   else
+				       echo "-drive if=scsi,id=hdd${num},file=${disk},format=raw "
+				       
+				   fi
+			       fi
+			   fi
+			   
+			
+			;;*)
+			
+		    esac
+		    ;;
+		BASE)
+		    num=$ii
+		    case $DiskMode in
+			BaseStorage)
+             		    if [ "${HOSTARCH}" == "ARM" ]; then
+				echo "-drive if=none,id=hdd${num},file=${disk},format=raw -device virtio-blk-device,drive=hdd${num} "
+			    else
+				if [ "${VMARCH}" == "ARM" ]; then
+				    echo "-drive if=none,id=hdd${num},file=${disk},format=raw -device virtio-blk-device,drive=hdd${num} "
+				    
+				else
+				    echo "-drive if=none,id=hdd${num},file=${disk},format=raw -device virtio-blk-pci,drive=hdd${num} "
+				    
+				fi
+			    fi
+			    
+			;;
+			ScsiStorage)
+             		    if [ "${HOSTARCH}" == "ARM" ]; then
+				echo "-drive if=none,id=hdd${num},file=${disk},format=raw -device scsi-hd,drive=hdd${num} "
+			    else
+				if [ "${VMARCH}" == "ARM" ]; then
+				    echo "-drive if=none,id=hdd${num},file=${disk},format=raw -device scsi-hd,drive=hdd${num} "
+				    
+				else
+				    echo "-drive if=scsi,id=hdd${num},file=${disk},format=raw "
+				    
+				fi
+			    fi
+			
+			;;*)
+			
+		    esac
+		    ;;
+		*)
+		    
+	    esac
+	    
+	    ;;
+	append)
+	case "${ROOTFSTYPE}" in
+	    NFS)
+	    if [ "$CheckGW" == "Yes" ]; then
+		echo "console=ttyAMA0 root=/dev/nfs nfsroot=${IMAGE[0]} ip=${IP[0]}::${GW0}:${HOSTMASK}::${ETH[0]} rdinit=/init "
+		
+	    else
+		echo "console=ttyAMA0 root=/dev/nfs nfsroot=${IMAGE[0]} ip=${IP[0]}:::${HOSTMASK}::${ETH[0]} rdinit=/init "
+		
+	    fi
+            ;;
+	    BASE)
+	    if [ "$CheckGW" == "Yes" ]; then
+		echo "console=ttyAMA0 root=/dev/${PreFixDisk}a2 rw rootwait ip=${IP[0]}::${GW0}:${HOSTMASK}::${ETH[0]} "
+	    else
+		echo "console=ttyAMA0 root=/dev/${PreFixDisk}a2 rw rootwait ip=${IP[0]}:::${HOSTMASK}::${ETH[0]} "
+
+	    fi
+
+	    ;;
+	    *)
+						    
+	    esac
+	;;
+	
+	*)
+	
+    esac
+}
+
+
+
+
+
+
+
+
+
+
+
+### Main script 
+unset IMAGE GUESTNAME NET Ans DATE
+DATE=$(date +%y%m%d%H%M%S)
+# Check Value
+if [ "$#" -ge "3" ]; then
+    GUESTNAME=$1
+    IMAGE=($2)
+    NET=($3)
+    if [ "$#" -eq "4" ]; then
+	unset ShareData ShareLen ShareDir ShareMount ShareName MultiSharedDir
+	PrtInfo "Using multi share directory."
+	ShareData=($4)
+	# Check shared file
+	ShareLen=$(( ${#ShareData[@]} - 1 ))
+	MultiShareDir='Yes'
+	for ii in $(seq 0  ${ShareLen}); do
+	    ShareDir[$ii]=$(awk -F ':' '{print $1}' <<<${ShareData[$ii]})
+	    ShareMount[$ii]=$(awk -F ':' '{print $2}' <<<${ShareData[$ii]})
+	    ShareName[$ii]=$(tr "/" "0" <<<${ShareDir[$ii]})
+	    if [ -z ${ShareDir[$ii]} ] || [ -z ${ShareMount[$ii]} ]; then
+		PrtErr "Share directory format not correct."
+	    else
+		PrtInfo "Share directory will mount host ${ShareDir[$ii]} on guest ${ShareMount[$ii]} with name ${ShareName[$ii]} "
+	    fi
+	    if [ ! -d ${ShareDir[$ii]} ]; then
+		PrtErr "No share diectory found."
+	    fi
+	done
+    fi
+else
+    PrtHelp
+    exit 127
+fi
+
+# Check kernel mod
+Ans=$(CheckKernelModules)
+if [ "$Ans" == "Yes" ]; then
+    PrtInfo "Need kernel modules check succeed. "
+else
+    echo $Ans
+    PrtErr "Kernel mode not found."
+fi
+
+# Check Package
+Ans=$(CheckNeededPackages)
+if [ "$Ans" == "Yes" ]; then
+    PrtInfo "Need package check succeed. "
+else
+    echo $Ans
+    PrtErr "Package lost."
+fi
+
+# Check System arch
+unset HOSTARCH 
+if [ -f /bin/uname ]; then
+    Ans=''
+    Ans=$(ArchTest host "$(uname -m )")
+    if [ "$Ans" == "Yes" ]; then
+	HOSTARCH=$( ArchTag /sbin/init )
+    else
+	PrtErr "Host architecture not support, please check host architecture is arm or x86_64."
+    fi
+    PrtInfo "Host system architecture is : ${HOSTARCH}"
+else
+    PrtErr "No system file found."
+fi
+
+# Check data dir
+if [ ! -d ../data ]; then
+    PrtInfo "No found data directory, create new."
+    mkdir -p ../Kernel/${GUESTNAME}
+    if [ "$?" -eq "0"  ]; then
+	PrtInfo "data dir create succeed."
+    else
+	PrtErr "Cannot create data dir,please check ../data dir." 
+    fi
+fi
+
+# Set Tap name
+unset TAPNAME TAP GUESTTAP
+# Short tap name into 8 words
+GUESTTAP=$( egrep -o "[0-9a-zA-Z]+" <<<${GUESTNAME}|tr "\n" " "|sed 's/ //g')
+###Old Way for tap name
+if [ "$(wc -c <<< ${GUESTTAP})" -gt "9" ]; then
+### Using md5sum to random tap name
+    #TAPNAME="tap$(cut -b-4<<<${GUESTTAP})$(md5sum <<<${GUESTTAP}|cut -c1-5)"
+### Using first four and last four character as tap name 
+    TAPNAME="tap$(sed -e 's/\(...\).*\(...\)$/\1\2/g' <<<${GUESTTAP})p"
+    PrtWarn "VM name too long,replace tap name as ${TAPNAME}"
+else
+    TAPNAME="tap${GUESTTAP}p"
+fi
+
+# Set Net 
+# PrtInfo "Check Net value"
+unset NetLen IP testifconfig HOSTIP HOSTMASK CheckGW NetGW NetMode
+# Check Net mode
+Ans=($(CheckNetMode ${NET[@]}))
+if [ -z ${Ans[0]} ]; then
+    PrtErr "Network support list : Ovs, MacV(Macvtap/Macvlan), Base"
+fi
+NetMode=${Ans[0]}
+PrtInfo "Net mode: $NetMode"
+# If neet shift array do shift.
+if [ "${Ans[1]}" == "Yes" ]; then
+    NET=(${NET[@]:1})
+fi
+NetLen=$((${#NET[@]} -1 )) # N Len, using 0 to N-1
+testifconfig=$(/sbin/ifconfig |egrep -o "inet [0-9]+.[0-9]+.[0-9]+.[0-9]+")
+
+for ii  in $(seq 0 ${NetLen}); do
+    # First value need to check gateway ip address
+    if [ "$ii" -eq "0" ]; then
+	# Loading custom gateway if it exist.
+	GW0=$(awk -F ',' '{print $3}' <<< ${NET[$ii]} ) # GW0
+	Ans=$(CheckIpFormat ${GW0})
+	if [ "$Ans" == "Yes" ]; then
+	    PrtInfo "Using custom gateway: $GW0"
+	    CheckGW='Yes'
+	else
+	    CheckGW='No'
+	fi
+
+    fi
+    # Let ip address and connect host ether card tranform to array
+    IP[$ii]=$(awk -F ',' '{print $1}' <<< ${NET[$ii]} ) # IP[0] == IP0
+    ETH[$ii]=$(awk -F ',' '{print $2}' <<< ${NET[$ii]} ) # ETH[0] ==ETH0
+
+    # check ether card exist 
+    Ans=$(CheckEth ${ETH[$ii]})
+    if [ "$Ans" == "No" ]; then
+	PrtErr "Network interface: ${ETH[$ii]} not found, please check value carefully."
+    fi
+    
+    # check ip address correct
+    Ans=$(CheckIpFormat ${IP[$ii]})
+    if [ "$Ans" == "No" ]; then
+	PrtErr "IP failed."
+    fi
+    
+    # create random mac address 
+    MAC[$ii]=$(MacRandom ${ETH[$ii]})
+
+    # get host ip and mask by ifconfig 
+    test -z "$testifconfig"
+    if [ "$?" -eq "0" ]; then
+	HOSTIP[$ii]=$(/sbin/ifconfig ${ETH[$ii]} |egrep -o "inet addr:[0-9]+.[0-9]+.[0-9]+.[0-9]+" |sed 's/inet addr://g')
+	HOSTMASK[$ii]=$(/sbin/ifconfig ${ETH[$ii]} |egrep -o "Mask:[0-9]+.[0-9]+.[0-9]+.[0-9]+"|sed 's/Mask://g')
+    else
+	HOSTIP[$ii]=$(/sbin/ifconfig ${ETH[$ii]} |egrep -o "inet [0-9]+.[0-9]+.[0-9]+.[0-9]+" |sed 's/inet //g')
+	HOSTMASK[$ii]=$(/sbin/ifconfig ${ETH[$ii]} |egrep -o "netmask [0-9]+.[0-9]+.[0-9]+.[0-9]+" |sed 's/netmask //g')
+    fi
+
+    # Test Host IP if NetMode is Base or ovs #Fix on 2018-01-18
+    if [ "$NetMode" == "BaseNet" ] || [ "$NetMode" == "OvsNet" ]; then
+	Ans=$(CheckIpFormat ${HOSTIP[$ii]})
+	if [ "$Ans" == "No" ]; then
+	    PrtErr "Host IP not found on ether card: ${ETH[$ii]}."
+	fi
+    fi
+
+    TAP[$ii]="$TAPNAME$ii"
+    PrtInfo "IPaddr$ii is ${IP[$ii]}. Guest eth$ii access network through host ${ETH[$ii]}."
+    PrtInfo "Guest eth$ii's Mac$ii is ${MAC[$ii]} and connect to tap name is ${TAP[$ii]}."
+    # PrtInfo "Tap$ii ip is ${HOSTIP[$ii]} and mask ${HOSTMASK[$ii]}." # Not importent
+
+# Check IPs
+    if [ "$ii" -eq "0" ]; then
+	# If not using custom gateway
+	if [ ! "$CheckGW" == "Yes" ]; then
+	    # check vm ip and host are same subnet.
+	    Ans=($(check-same-subnet subnet ${IP[$ii]} ${ETH[$ii]}))
+	    if [ "${Ans[0]}" == "Yes" ]; then
+		PrtInfo "Guest IP has same subnet, checking correct gateway"
+		HOSTIP[$ii]=${Ans[1]}
+		HOSTMASK[$ii]=${Ans[2]}
+		# Gateway is public ip, then check default gateway 
+		/sbin/ip route show |grep via |grep ${ETH[$ii]} &>/dev/null
+		if [ "$?" -eq "0" ]; then
+		    GW0=($(/sbin/ip route show |grep via | grep ${ETH[$ii]} |awk -F ' ' '{print $3 }' ))
+		    if [ -z ${GW0[@]} ]; then
+			GW0="${HOSTIP[$ii]}"
+			PrtInfo "Using host as gateway: ${HOSTIP[$ii]} "
+		    else
+			for gw0 in ${GW0[@]}; do
+			    Ans=($( check-same-subnet subnet $gw0  ${ETH[$ii]} ))
+			    if [ "${Ans[1]}" == "${HOSTIP[$ii]}" ]; then
+				GW0="$gw0"
+				PrtInfo "Replace gateway: ${HOSTIP[$ii]} to $GW0 "
+			    else
+				GW0="${HOSTIP[$ii]}"
+				PrtInfo "Using host as gateway: ${HOSTIP[$ii]} "
+			    fi
+			done
+		    fi
+		    Ans=
+		    CheckGW='Yes'
+		else
+		    CheckGW='No'
+		    GW0="${HOSTIP[$ii]}"
+		    PrtInfo "Using host as gateway: ${HOSTIP[$ii]} "
+		fi
+		PrtInfo "Guest IP has same subnet, using default gateway: $GW0"
+	    else
+		# check host router table has same subnet.
+		GW0=$(ip route show |grep 'scope link' |grep ${ETH[$ii]} | egrep -o "^$(egrep -o "[0-9]+.[0-9]+.[0-9]+."<<<${IP[$ii]})0.*$" | egrep -o "src [0-9]+.[0-9]+.[0-9]+.[0-9]+" |sed 's/src //g')
+		if [ ! -z ${GW0} ]; then
+		    CheckGW='Yes'
+		else
+		    # Not same subnet, check private
+		    Ans=$(check-same-subnet private ${HOSTIP})
+		    if [ "$Ans" == "Yes" ]; then
+			# No same subnet found on host, check default gateway has vm ip gateway.
+			NetGW=$(ip route show|egrep -o "^default.*$" |awk -F ' ' '{print $3}')
+			PrtInfo "Host IP is private, check VM gateway from default gw: ${NetGW} "
+			# Check VM IP are private
+			Ans=$(check-same-subnet private ${IP[$ii]})
+			if [ "$Ans" == "Yes" ]; then
+			    GW0=$(ssh -t $(whoami)@$NetGW 'ip route show' 2>/dev/null |grep 'scope link' | egrep -o "^$(egrep -o "[0-9]+.[0-9]+.[0-9]+."<<<${IP[$ii]})0.*$" | egrep -o "src [0-9]+.[0-9]+.[0-9]+.[0-9]+" |sed 's/src //g')
+			else
+			    GW0=$(ssh -t $(whoami)@$NetGW 'ip route show' 2>/dev/null |grep '^default via '|egrep -o [0-9]+.[0-9]+.[0-9]+.[0-9]+ )
+			fi
+			if [ ! -z ${GW0} ]; then
+			    CheckGW='Yes'
+			else
+			    GW0=${HOSTIP[$ii]}
+			    CheckGW='No'
+			fi
+			
+
+		    else
+			PrtInfo "Host IP is public, using host as default gateway."
+			GW0=${HOSTIP[$ii]}
+			CheckGW='No'
+		    fi
+		fi
+	    fi
+	fi
+	PrtInfo "Gateway IP is \"${GW0}\""
+    fi
+done
+# Get Root permission
+PrtInfo "Super user permission test"
+echo "Super User passwd, please:"
+if [ $EUID -ne 0 ]
+   then sudo echo -ne ""
+        if [ $? -ne 0 ]
+            then  PrtErr "Sorry, need su privilege!"
+        else
+            PrtInfo "Super user permission  test: succeed."
+            SUDO=$(which sudo)
+        fi
+else
+    SUDO=''
+fi
+
+# Check nbd already load
+${SUDO} qemu-nbd --disconnect /dev/nbd0 &>/dev/null
+${SUDO} rmmod nbd &>/dev/null
+lsmod |grep nbd &>/dev/null
+if [ "$?" -eq "0" ]; then
+    PrtWarn "nbd modules already loading, start to take it off."
+    ${SUDO} rmmod nbd
+    if [ "$?" -ne "0" ]; then
+	PrtErr "nbd modules cannot stop,please check nbd module first."
+    fi
+fi
+if [ ! -b /dev/nbd0 ]; then
+    PrtInfo "Using /dev/nbd0 as loop device."
+else
+    PrtErr "/dev/nbd0 already exist, please check or reset nbd modules."
+fi
+
+# Set Disk
+PrtInfo "Check Disk value"
+unset DiskLen  QEMUIMG DiskInfo CheckDiskPath ROOTFSTYPE ROOTFS Checkpartition etcnum varnum tmpnum homenum VMARCH NFSdir KernelPath NFSKernelNew CMD DiskMode
+# Check Disk mode
+Ans=($(CheckDiskMode ${IMAGE[@]}))
+if [ -z ${Ans[0]} ]; then
+    PrtErr "QEMU storage format list : Base, Scsi"
+fi
+DiskMode=${Ans[0]}
+if [ "$DiskMode" == "ScsiStorage" ]; then
+    PreFixDisk="sd"
+elif [ "$DiskMode" == "BaseStorage" ];then
+    PreFixDisk="vd"
+fi
+
+PrtInfo "QEMU storage mode: $DiskMode"
+# If neet shift array do shift.
+if [ "${Ans[1]}" == "Yes" ]; then
+    IMAGE=(${IMAGE[@]:1})
+fi
+
+DiskLen=$((${#IMAGE[@]} -1 )) # N Len, using 0 to N-1
+for ii  in $(seq 0 $DiskLen); do
+    # qemu tools check 
+    QEMUIMG=$(which qemu-img)
+    if [ -z $QEMUIMG ]; then
+	PrtErr "No qemu-img found, please install qemu on system"
+    fi
+
+    if [ "$ii" -eq "0" ]; then
+	CheckDiskPath=($( tr ":" " "  <<< ${IMAGE[$ii]}))
+	if [ -f ${IMAGE[$ii]} ]; then
+	    Ans=$(CheckImageFile ${IMAGE[$ii]})
+	    if [ "$Ans" == "Yes" ]; then
+		PrtInfo "Found main hard disk file : ${IMAGE[$ii]}"
+		ROOTFSTYPE="BASE"
+		
+	    else
+		PrtErr "${IMAGE[$ii]} file is not an image file."
+	    fi
+	
+	elif [ "${#CheckDiskPath[@]}" -eq "2" ]; then
+	    Ans=$(CheckIpFormat ${CheckDiskPath[0]})
+	    if [ "$Ans" == "Yes" ]; then
+		PrtInfo "Start to check nfs mount point."
+		# Create shared kernel directory 
+		NFSdir=$(sed 's/\///g' <<< ${CheckDiskPath[1]})
+		if [ ! -d ../Kernel/${NFSdir} ]; then
+		    PrtInfo "Create new NFS shared kernel directory."
+		    mkdir -p ../Kernel/${NFSdir}
+		    NFSKernelNew='Yes'
+		else
+		    PrtWarn "Found exist NFS kernel directory, will check which is newest."
+		    if [ -f ${NFSdir}/zImage ]; then
+			NFSKernelNew='No'
+		    else
+			NFSKernelNew='Yes'
+		    fi
+		fi
+		mkdir -p /tmp/tmp-$DATE
+		${SUDO} mount -t nfs ${IMAGE[$ii]} /tmp/tmp-$DATE &>/dev/null
+		if [ "$?" -eq "0" ]; then
+		    PrtInfo "Mount Nfs path sucessed."
+		    Ans=$(CheckRootfs /tmp/tmp-$DATE )
+		    if [ "$Ans" == "Yes" ]; then
+			PrtInfo "Found system file."
+			VMARCH=$( ArchTag /tmp/tmp-$DATE/sbin/init )
+			case "$?" in
+			    "32")
+			    QEMUSystem='qemu-system-arm'
+			    CPUMode='cortex-a15'
+			    ;;
+			    "64")
+			    QEMUSystem='qemu-system-aarch64'
+			    CPUMode='cortex-a57'
+			    ;;*)
+			    
+			esac
+			Ans=$(ArchTest match "$HOSTARCH" "$VMARCH")
+			if [ "$Ans" == "Yes" ]; then
+			    VMARCH=$( ArchTag /tmp/tmp-$DATE/sbin/init )
+
+			else
+			    ${SUDO} umount /tmp/tmp-$DATE
+			    ${SUDO} rm -rf /tmp/tmp-$DATE
+			    PrtErr "VM arch not match host arch."
+			    
+			fi
+			PrtInfo "Guest system architecture is : ${VMARCH} "
+			if [ -f /tmp/tmp-${DATE}/boot/zImage ]; then
+			    # Copy nfs root kernel image if VMARCH is arm
+			    if [ "${VMARCH}" == "ARM" ]; then
+				PrtInfo "Fount kernel image"
+				# Check Kernel and data dir
+				if [ -d ../Kernel/ ]; then
+				    PrtInfo "Create Kernel dir"
+				    if [ ! -d ../Kernel/${GUESTNAME} ]; then
+					mkdir ../Kernel/${GUESTNAME}
+				    else
+					PrtWarn "Kernel dir is used, please check dir :../Kernel/${GUESTNAME} or change hostname. "
+					if [ -f "../Kernel/${GUESTNAME}/zImage" ] || [ -L "../Kernel/${GUESTNAME}/zImage" ]; then
+					    rm -rf ../Kernel/${GUESTNAME}/zImage
+ 					fi
+					if [ -f "../Kernel/${GUESTNAME}/initrd.img" ] || [ -L "../Kernel/${GUESTNAME}/initrd.img" ]; then
+					    rm -rf ../Kernel/${GUESTNAME}/initrd.img
+					fi
+				    fi
+				else
+				    PrtInfo "No found Kernel directory, create new."
+				    mkdir -p ../Kernel/${GUESTNAME}
+				    if [ "$?" -eq "0"  ]; then
+					PrtInfo "Kernel dir create succeed."
+				    else
+					PrtWarn "Cannot create kernel dir,please check ../Kernel dir." 
+				    fi
+				fi
+
+				if [ -L /tmp/tmp-${DATE}/boot/zImage ]; then
+				    KernelPath=$(${SUDO} find  /tmp/tmp-${DATE}/boot/ -name $(readlink /tmp/tmp-${DATE}/boot/zImage))
+				    if [ "${NFSKernelNew}" == "Yes" ]; then
+					cp ${KernelPath} ../Kernel/${NFSdir}/zImage
+					cp $(sed 's/vmlinuz/initrd.img/g' <<< ${KernelPath} ) ../Kernel/${NFSdir}/initrd.img
+				    else
+					if [[ ${KernelPath} -nt ${NFSdir}/zImage ]]; then
+					    cp ${KernelPath} ../Kernel/${NFSdir}/zImage
+					    cp $(sed 's/vmlinuz/initrd.img/g' <<< ${KernelPath} ) ../Kernel/${NFSdir}/initrd.img
+					else
+					    PrtWarn "Nfs Kernel no change."
+					fi
+				    fi
+				else
+				    cp ${KernelPath} ../Kernel/${NFSdir}/zImage
+				    cp $(CheckNewer $(${SUDO} find /tmp/tmp-${DATE}/rootfs/boot/ -name "initrd.img*")) ../Kernel/${NFSdir}/initrd.img
+				fi
+				CMD=$(pwd)
+				cd ../Kernel/${GUESTNAME}
+				if [ -f ./zImage ]; then
+				    ${SUDO} rm ./zImage
+				fi
+				if [ -f ./initrd.img ]; then
+				    ${SUDO} rm ./initrd.img
+				fi
+				ln -s ../${NFSdir}/zImage .
+				ln -s ../${NFSdir}/initrd.img .
+				cd ${CMD}
+			    fi
+			    # Clean nfs rootfs udev
+			    if [ -f /tmp/tmp-$DATE/etc/udev/rules.d/70-persistent-net.rules ]; then
+				PrtInfo "Clean Nfs rootfs 70-persistent-net.rules file "
+				${SUDO} rm -rf /tmp/tmp-$DATE/etc/udev/rules.d/70-persistent-net.rules
+			    fi
+			    #Check fstab has etc var home tmp partition
+			    if [ -f /tmp/tmp-${DATE}/etc/fstab ]; then
+				readarray -t Checkpartition< <(cat /tmp/tmp-${DATE}/etc/fstab | egrep -o "^/dev/${PreFixDisk}a[0-9]+.*$"|awk -F ' ' '{print $2}')
+				len=$((${#Checkpartition[@]} -1 ))
+				for jj in $(seq 0 $len ); do
+				    case ${Checkpartition[$jj]} in
+					"/etc")
+					    etcnum=$(($jj +1 ))
+					    ;;
+					    "/var")
+						varnum=$(( $jj + 1 ))
+						;;
+					    "/home")
+						homenum=$(( $jj + 1 ))
+						;;
+					    "/tmp")
+						tmpnum=$(( $jj + 1 ))
+						;;
+				    esac
+				done
+				if [ -z ${etcnum} ] || [ -z ${varnum} ] || [ -z $homenum ] || [ -z $tmpnum ]; then
+				    ${SUDO} umount /tmp/tmp-$DATE
+				    ${SUDO} rm -rf /tmp/tmp-$DATE
+				    PrtErr "No etc, var, home, tmp mount point on Nfs rootfs fstab"
+				    
+				fi
+				# Check Share mount point 
+				if [ "${MultiShareDir}" == "Yes" ]; then
+				    for ii in $(seq 0  ${ShareLen}); do
+					if [ ! -d /tmp/tmp-${DATE}/${ShareMount[$ii]} ]; then
+					    PrtInfo "Nfs rootfs no share directory mount point, create new."
+					    ${SUDO} mkdir -p /tmp/tmp-${DATE}/${ShareMount[$ii]}
+					fi
+					done
+				fi
+				    
+			    else
+				${SUDO} umount /tmp/tmp-$DATE
+				${SUDO} rm -rf /tmp/tmp-$DATE
+				PrtErr "No fstab found."
+				fi
+			else
+			    ${SUDO} umount /tmp/tmp-$DATE
+			    ${SUDO} rm -rf /tmp/tmp-$DATE
+			    PrtErr "No zImage found on nfs server."
+			fi
+			${SUDO} umount /tmp/tmp-$DATE
+			${SUDO} rm -rf /tmp/tmp-$DATE
+			ROOTFSTYPE="NFS"
+			ROOTFS="${IMAGE[$ii]}"
+		else
+			${SUDO} umount /tmp/tmp-$DATE
+			${SUDO} rm -rf /tmp/tmp-$DATE
+			PrtErr "There is no system file into nfs root path."
+		    fi
+		else
+		    PrtErr "NFS server IP format not correct."
+		fi
+	    else
+		PrtErr "NFS server IP format not correct."
+	    fi
+	else
+	    PrtErr "NFS root path error, please using $NFSIP:$NFSMROOTFSPATH as first hard disk file"
+	fi
+    fi
+    if [ "$ii" -ne "0" ]; then
+	PrtInfo "Check $ii image "
+	file ${IMAGE[$ii]} &>/dev/null
+	if [ "$?" -eq "0" ]; then
+	    Ans=$(CheckImageFile ${IMAGE[$ii]})
+	    if [ "$Ans" == "Yes" ]; then
+		PrtInfo "Found hard disk file : ${IMAGE[$ii]}"
+	    else
+		PrtErr "${IMAGE[$ii]} file is not an image file."
+	    fi
+	else
+	    PrtErr "File not found. : ${IMAGE[$ii]}"
+	fi
+    fi
+done
+
+PrtInfo "Root path type : ${ROOTFSTYPE}"
+
+# Check Root Path
+unset PartitionNum ImageSize LOOPDEV
+LOOPDEV='/dev/loop0'
+${SUDO} mkdir -p /tmp/tmp-${DATE}
+case ${ROOTFSTYPE} in
+    NFS)
+    if [ -z ${IMAGE[1]} ]; then
+	${SUDO} rm -rf /tmp/tmp-$DATE
+	PrtErr "According to security reason, using nfs as root filesystem must have local image file to save data."
+    fi
+    ImageSize="$(($(awk -F ' ' '{print $1}'<<<$(du -bs ${IMAGE[1]}))/1024/1024 ))"
+    if [ "$ImageSize" -lt "1024" ]; then
+	${SUDO} rm -rf /tmp/tmp-$DATE
+	PrtErr "${IMAGE[1]} size too small, nfs local image file need more than 1024 MiB."
+    fi
+    ${SUDO} /sbin/fdisk -l ${IMAGE[1]} | egrep -o "${IMAGE[1]}[0-9].*$" &>/dev/null
+    if [ "$?" -ne "0" ]; then
+	PrtInfo "Secondary file has no partition, start to copy file from nfs rootfs path."
+	${SUDO} mkdir -p /tmp/tmp-${DATE}/rootfs /tmp/tmp-${DATE}/etc /tmp/tmp-${DATE}/var /tmp/tmp-${DATE}/home /tmp/tmp-${DATE}/tmp 
+	CreatePartition ${IMAGE[1]}
+	PrtInfo "Mount nfs rootfs and copy etc,var,home data into local image."
+	SetupImage up ${IMAGE[1]} $LOOPDEV 
+	${SUDO} mount -t nfs ${IMAGE[0]} /tmp/tmp-${DATE}/rootfs
+	${SUDO} /sbin/e2fsck -y ${LOOPDEV}p${etcnum} &>/dev/null
+	${SUDO} /sbin/e2fsck -y ${LOOPDEV}p${varnum} &>/dev/null
+	${SUDO} /sbin/e2fsck -y ${LOOPDEV}p${homenum} &>/dev/null
+	${SUDO} /sbin/e2fsck -y ${LOOPDEV}p${tmpnum} &>/dev/null
+	${SUDO} mount ${LOOPDEV}p${etcnum} /tmp/tmp-${DATE}/etc
+	${SUDO} mount ${LOOPDEV}p${varnum} /tmp/tmp-${DATE}/var
+	${SUDO} mount ${LOOPDEV}p${homenum} /tmp/tmp-${DATE}/home
+	${SUDO} mount ${LOOPDEV}p${tmpnum} /tmp/tmp-${DATE}/tmp
+	${SUDO} chmod o+rwx /tmp/tmp-${DATE}/tmp
+	${SUDO} cp -a /tmp/tmp-${DATE}/rootfs/etc/* /tmp/tmp-${DATE}/etc/
+	${SUDO} cp -a /tmp/tmp-${DATE}/rootfs/var/* /tmp/tmp-${DATE}/var/
+	${SUDO} cp -a /tmp/tmp-${DATE}/rootfs/home/* /tmp/tmp-${DATE}/home/
+	${SUDO} umount /tmp/tmp-${DATE}/tmp
+	${SUDO} umount /tmp/tmp-${DATE}/home
+	${SUDO} umount /tmp/tmp-${DATE}/var
+	${SUDO} umount /tmp/tmp-${DATE}/etc
+	${SUDO} umount /tmp/tmp-${DATE}/rootfs
+	SetupImage down $LOOPDEV 
+    else
+	PrtWarn "Secondary file already has partition table, do nothing on the file: ${IMAGE[1]}."
+    fi
+    ${SUDO} rm -rf /tmp/tmp-$DATE
+    
+    ;;
+    BASE)
+    PartitionNum=$(${SUDO} /sbin/fdisk -l ${IMAGE[0]} |egrep -o "${IMAGE[0]}[0-9]" |wc -l )
+    if [ "${PartitionNum}" -ge "2" ]; then
+	PrtInfo "Found more than two partition for system image file."
+    else
+	PrtErr "This script just support more than two partition system image file, please check there are two partition boot and root in the image. "
+    fi
+    SetupImage up ${IMAGE[0]} $LOOPDEV
+    ${SUDO} /sbin/e2fsck -y ${LOOPDEV}p2 &>/dev/null
+    ${SUDO} mount ${LOOPDEV}p2 /tmp/tmp-${DATE}
+    #Check mount succeed
+    if [ "$?" -eq "0" ]; then 
+	PrtInfo "Mount ${IMAGE[0]} secondary partition succeed, start to check root file system."
+	# Check sysvinit
+	Ans=$(CheckRootfs /tmp/tmp-$DATE )
+	if [ "$Ans" == "Yes" ]; then
+	    PrtInfo "Find system file on root partition."
+	    VMARCH=$(ArchTag /tmp/tmp-$DATE/sbin/init )
+	    case "$?" in
+		"32")
+	           QEMUSystem='qemu-system-arm'
+	  	   CPUMode='cortex-a15'
+		   ;;
+		 "64")
+		   QEMUSystem='qemu-system-aarch64'
+		   CPUMode='cortex-a57'
+		    ;;*)
+			    
+	    esac
+
+	    Ans=$(ArchTest match "$HOSTARCH" "$VMARCH" )
+	    if [ "${Ans}" == "Yes" ]; then
+		VMARCH=$(ArchTag /tmp/tmp-$DATE/sbin/init )
+		PrtInfo "Guest system architecture is : ${VMARCH} "
+	    else
+		
+		${SUDO} umount /tmp/tmp-${DATE}
+		SetupImage down $LOOPDEV
+		${SUDO} rm -rf /tmp/tmp-${DATE}
+		PrtErr "VM arch not match host arch."
+
+		
+	    fi
+	    ROOTFS="/dev/${PreFixDisk}a2"
+	    # Check boot dir
+	    if [ -d /tmp/tmp-${DATE}/boot ]; then
+		${SUDO} /sbin/e2fsck -y ${LOOPDEV}p1 &>/dev/null
+		${SUDO} mount ${LOOPDEV}p1 /tmp/tmp-${DATE}/boot/
+		# Copy root kernel image if VMARCH is arm
+		if [ "${VMARCH}" == "ARM" ]; then
+		    # Check Kernel and data dir
+		    if [ -d ../Kernel/ ]; then
+			PrtInfo "Create Kernel dir"
+			if [ ! -d ../Kernel/${GUESTNAME} ]; then
+			    mkdir ../Kernel/${GUESTNAME}
+			else
+			    PrtWarn "Kernel dir is used, please check dir :../Kernel/${GUESTNAME} or change hostname. "
+			    if [ -f "../Kernel/${GUESTNAME}/zImage" ] || [ -L "../Kernel/${GUESTNAME}/zImage" ]; then
+				rm -rf ../Kernel/${GUESTNAME}/zImage
+			    fi
+			    if [ -f "../Kernel/${GUESTNAME}/initrd.img" ] || [ -L "../Kernel/${GUESTNAME}/initrd.img" ]; then
+				rm -rf ../Kernel/${GUESTNAME}/initrd.img
+			    fi
+			fi
+		    else
+			PrtInfo "No found Kernel directory, create new."
+			mkdir -p ../Kernel/${GUESTNAME}
+			if [ "$?" -eq "0"  ]; then
+					PrtInfo "Kernel dir create succeed."
+			else
+			    PrtWarn "Cannot create kernel dir,please check ../Kernel dir." 
+			fi
+		    fi
+		    KernelPath=$(${SUDO} find /tmp/tmp-${DATE}/boot -type f -name "vmlinuz-*")
+		    # Copy zImage and initrd.img
+		    if [ -f /tmp/tmp-${DATE}/boot/zImage ]; then
+			PrtInfo "Mount ${IMAGE[0]} primary partition succed, start to copy zImage and initrd.img"
+			if [ -L /tmp/tmp-${DATE}/boot/zImage ]; then
+			    cp $(${SUDO} find  /tmp/tmp-${DATE}/boot/ -name $(readlink /tmp/tmp-${DATE}/boot/zImage)) ../Kernel/${GUESTNAME}/zImage
+			    cp $(${SUDO} find  /tmp/tmp-${DATE}/boot/ -name $(readlink /tmp/tmp-${DATE}/boot/zImage) | sed 's/vmlinuz/initrd.img/g') ../Kernel/${GUESTNAME}/initrd.img
+			else
+			    cp /tmp/tmp-${DATE}/boot/zImage ../Kernel/${GUESTNAME}/zImage
+			    cp $(CheckNewer $(${SUDO} find /tmp/tmp-${DATE}/boot/ -name "initrd.img*")) ../Kernel/${GUESTNAME}/initrd.img
+			fi
+		    elif [ -f ${KernelPath} ];then
+			PrtInfo "Mount ${IMAGE[0]} primary partition succed, start to copy zImage and initrd.img"
+			cp ${KernelPath} ../Kernel/${GUESTNAME}/zImage
+			cp $(${SUDO} find  /tmp/tmp-${DATE}/boot/ -name "initrd.img-*" ) ../Kernel/${GUESTNAME}/initrd.img
+		    else
+			PrtWarn "No zImage found on system."
+		    fi
+		fi
+		# Umount /boot partition
+		${SUDO} umount /tmp/tmp-${DATE}/boot/
+	    else
+		${SUDO} umount /tmp/tmp-${DATE}
+		SetupImage down  $LOOPDEV
+		${SUDO} rm -rf /tmp/tmp-${DATE}
+		PrtErr "No boot directory on root file system."
+	    fi
+	    # Umount root partition
+	    ${SUDO} umount /tmp/tmp-${DATE}
+	    SetupImage down $LOOPDEV
+	    ${SUDO} rm -rf /tmp/tmp-$DATE
+	else
+	    ${SUDO} umount /tmp/tmp-${DATE}
+	    SetupImage down $LOOPDEV
+	    ${SUDO} rm -rf /tmp/tmp-$DATE
+	    PrtErr "No sysvinit on secondary partition, please let secondary partition as root partition."
+	fi
+    else
+	SetupImage down $LOOPDEV
+	${SUDO} rm -rf /tmp/tmp-$DATE
+	PrtErr "Mount root partition failed, please check image file: ${IMAGE[0]} secondary partition can mount on system."
+    fi
+
+    ;;*)
+    PrtErr "ROOT filesystem type not found, please check disk format."
+esac
+# Test VM ARCH and Host ARCH
+if [ "${HOSTARCH}" == "ARM"  ]; then
+    if [ "${VMARCH}" == "ARM" ]; then
+	PrtInfo "Check architecture correct."
+    else
+	PrtErr "Guest architecture ${VMARCH} cannot running on Host."
+    fi
+else
+    PrtWarn "Guest architecture: ${VMARCH} will running on Host architecture: ${HOSTARCH}."
+    
+fi
+# Set VM local file
+unset ROOTPATH ETCPATH VARPATH HOMEPATH TMPPATH
+${SUDO} mkdir -p /tmp/tmp-${DATE}
+case ${ROOTFSTYPE} in
+    NFS)
+	SetupImage up ${IMAGE[1]} ${LOOPDEV}
+        ETCPATH=$(${SUDO} blkid ${LOOPDEV}* | egrep -o "${LOOPDEV}p[0-9]+: LABEL=\"etc\""|sed 's/: LABEL=\"etc\"//g')
+        VARPATH=$(${SUDO} blkid ${LOOPDEV}* | egrep -o "${LOOPDEV}p[0-9]+: LABEL=\"var\""|sed 's/: LABEL=\"var\"//g')
+        HOMEPATH=$(${SUDO} blkid ${LOOPDEV}* | egrep -o "${LOOPDEV}p[0-9]+: LABEL=\"home\""|sed 's/: LABEL=\"home\"//g')
+        TMPPATH=$(${SUDO} blkid ${LOOPDEV}* | egrep -o "${LOOPDEV}p[0-9]+: LABEL=\"tmp\""|sed 's/: LABEL=\"tmp\"//g')
+	if [[ -z ${ETCPATH} ]] || [[ -z ${VARPATH} ]] || [[ -z ${HOMEPATH} ]] || [[ -z ${TMPPATH} ]]; then
+	    SetupImage down  ${LOOPDEV}
+	    PrtErr "No partition label found, please add partition label etc,var,home,tmp.\nUsing \"# tune2fs -L \${LABEL} \${PARTITION}\" to create label on ${IMAGE[1]}"
+	fi
+
+	if [ "$ETCPATH" == "${LOOPDEV}p${etcnum}"  ]; then
+	    if [ "$VARPATH" == "${LOOPDEV}p${varnum}" ]; then
+		if [ "$HOMEPATH" == "${LOOPDEV}p${homenum}" ]; then
+		    if [ "$TMPPATH" == "${LOOPDEV}p${tmpnum}" ]; then
+			PrtInfo "All partition check succeed."
+		    else
+			SetupImage down ${LOOPDEV}
+			PrtErr "TMP partition number not correct, please check partition table is same as nfsrootfs: ${IMAGE[0]}/etc/fstab."
+		    fi
+		else
+		    SetupImage down ${LOOPDEV}
+		    PrtErr "HOME partition number not correct, please check partition table is same as nfsrootfs: ${IMAGE[0]}/etc/fstab."
+		fi
+	    else
+		SetupImage down ${LOOPDEV}
+		PrtErr "VAR partition number not correct, please check partition table is same as nfsrootfs: ${IMAGE[0]}/etc/fstab."
+	    fi
+	else
+	    SetupImage down ${LOOPDEV}
+	    PrtErr "ETC partition number not correct, please check partition table is same as nfsrootfs: ${IMAGE[0]}/etc/fstab."
+	    
+	fi
+	${SUDO} /sbin/e2fsck -y ${ETCPATH} &>/dev/null
+	${SUDO} mount ${ETCPATH} /tmp/tmp-${DATE}
+
+	PrtInfo "Found etc,var,home,tmp label."
+	# Network interface
+	PrtInfo "Network interfaces overwrite."
+	if [ -f /tmp/tmp-${DATE}/network/interfaces ]; then
+	    GuestInterface new ${IP[0]} eth0 ${HOSTMASK[0]}
+	    for ii in $(seq 1 ${NetLen}); do
+		GuestInterface add ${IP[$ii]} eth$ii ${HOSTMASK[$ii]}
+	    done
+	    ${SUDO} mv interface /tmp/tmp-${DATE}/network/interfaces
+	    cat /tmp/tmp-${DATE}/network/interfaces
+	    
+	fi
+	# DNS server replace
+	PrtInfo "DNS nameserver overwrite"
+	if [ -f ../DebianNetFiles/resolv.conf ]; then
+	    cp  ../DebianNetFiles/resolv.conf resolv.conf
+	else
+	    cp /etc/resolv.conf resolv.conf
+	fi
+	if [ -f /tmp/tmp-${DATE}/resolv.conf ]; then
+	    if [ -L /tmp/tmp-${DATE}/resolv.conf ]; then
+		# If resolv.conf is link file then remove it.
+		${SUDO} rm /tmp/tmp-${DATE}/resolv.conf
+	    fi
+	    ${SUDO} mv resolv.conf /tmp/tmp-${DATE}/resolv.conf
+	    cat /tmp/tmp-${DATE}/resolv.conf
+	fi
+	
+	# Hostname replace
+	PrtInfo "Hostname overwrite"
+	if [ -f ../DebianNetFiles/hosts ]; then
+	    cp  ../DebianNetFiles/hosts hosts
+	else
+	    cp /etc/hosts hosts
+	fi
+	if [ -f /tmp/tmp-${DATE}/hostname ] && [ -f /tmp/tmp-${DATE}/hosts ]; then
+	    ReplaceHostname hosts ${GUESTNAME} /tmp/tmp-${DATE}/hosts
+	    ReplaceHostname hostname ${GUESTNAME} /tmp/tmp-${DATE}/hostname
+	    
+	fi
+	cat /tmp/tmp-${DATE}/hosts
+	
+	# Host allow permission replace
+	PrtInfo "Hosts allow permission overwrite"
+	if [ -f ../DebianNetFiles/hosts.allow ]; then
+	    cp  ../DebianNetFiles/hosts.allow hosts.allow
+	    if [ -f ../DebianNetFiles/hosts.deny ]; then
+		cp ../DebianNetFiles/hosts.deny hosts.deny
+	    else
+		cp /etc/hosts.deny hosts.deny
+	    fi
+	else
+	    cp /etc/hosts.allow hosts.allow
+	fi
+	if [ -f /tmp/tmp-${DATE}/hosts.allow ] && [ -f /tmp/tmp-${DATE}/hosts.deny ]; then
+	    ${SUDO} mv hosts.allow  /tmp/tmp-${DATE}/hosts.allow
+	    ${SUDO} mv hosts.deny /tmp/tmp-${DATE}/hosts.deny
+	fi
+	cat /tmp/tmp-${DATE}/hosts.allow
+	PrtInfo "Host deny permission overwrite. "
+	cat /tmp/tmp-${DATE}/hosts.deny
+
+	# rc.local replace
+	PrtInfo "Create rc.local file"
+	if [ -f /tmp/tmp-${DATE}/rc.local ]; then
+	    ReplaceRclocal $HOSTIP $GW0
+	    ${SUDO} chmod +x rc.local
+	    ${SUDO} mv rc.local /tmp/tmp-${DATE}/rc.local
+	    cat /tmp/tmp-${DATE}/rc.local
+	fi
+	# sources list replace
+	PrtInfo "overwrite sourceslist"
+	if [ -f ../DebianNetFiles/sources.list ]; then
+	    cp  ../DebianNetFiles/sources.list sources.list
+	else
+	    cp /etc/sources.list sources.list
+	fi
+	
+	if [ -f /tmp/tmp-${DATE}/apt/sources.list ]; then
+	    ${SUDO} mv sources.list /tmp/tmp-${DATE}/apt/sources.list
+	fi
+	cat /tmp/tmp-${DATE}/apt/sources.list
+
+	# fstab replace
+	PrtInfo "Replace fstab"
+	if [ -f /tmp/tmp-${DATE}/fstab ]; then
+	    ReplaceFstab $ETCPATH $VARPATH $HOMEPATH $TMPPATH
+	    ${SUDO} mv fstab /tmp/tmp-${DATE}/fstab
+	    cat /tmp/tmp-${DATE}/fstab
+	fi
+	# inittab and securetty replace
+	if [ -f ../DebianNetFiles/inittab ] && [ -f ../DebianNetFiles/securetty ]; then
+	    PrtInfo "overwrite inittab and securetty "
+	    ${SUDO} cp ../DebianNetFiles/inittab /tmp/tmp-${DATE}/inittab
+	    ${SUDO} cp ../DebianNetFiles/securetty /tmp/tmp-${DATE}/securetty
+	fi
+	# ssh overwrite if it exist 
+	if [ -d /tmp/tmp-$DATE/etc/ssh ]; then
+	    if [ -f ../DebianNetFiles/ssh_config ] &&  [ -f ../DebianNetFiles/sshd_config ]; then
+		PrtInfo "overwrite ssh config file "
+		${SUDO} cp ../DebianNetFiles/ssh_config /tmp/tmp-$DATE/ssh/ssh_config
+		${SUDO} cp ../DebianNetFiles/sshd_config /tmp/tmp-$DATE/ssh/sshd_config
+	    fi
+	fi
+	# clean 70-persistent-net.rules
+	if [ -f /tmp/tmp-${DATE}/udev/rules.d/70-persistent-net.rules ];then
+	    PrtInfo "Clean 70-persistent-net.rules"
+	    ${SUDO} rm -rf /tmp/tmp-${DATE}/udev/rules.d/70-persistent-net.rules
+	fi
+	
+    ;;
+    BASE)
+	SetupImage up ${IMAGE[0]} ${LOOPDEV}
+	${SUDO} /sbin/e2fsck -y ${LOOPDEV}p2 &>/dev/null
+	${SUDO} mount ${LOOPDEV}p2 /tmp/tmp-${DATE}
+	# Network interface
+	PrtInfo "Network interfaces overwrite."
+	if [ -f /tmp/tmp-${DATE}/etc/network/interfaces ]; then
+	    GuestInterface new ${IP[0]} eth0 ${HOSTMASK[0]}
+	    for ii in $(seq 1 ${NetLen}); do
+		GuestInterface add ${IP[$ii]} eth$ii ${HOSTMASK[$ii]}
+	    done
+	    ${SUDO} mv interface /tmp/tmp-${DATE}/etc/network/interfaces
+	    cat /tmp/tmp-${DATE}/etc/network/interfaces
+	    
+	fi
+	# DNS server replace
+	PrtInfo "DNS nameserver overwrite"
+	if [ -f ../DebianNetFiles/resolv.conf ]; then
+	    cp  ../DebianNetFiles/resolv.conf resolv.conf
+	else
+	    cp /etc/resolv.conf resolv.conf
+	fi
+	if [ -f /tmp/tmp-${DATE}/etc/resolv.conf ]; then
+	    if [ -L /tmp/tmp-${DATE}/etc/resolv.conf ]; then
+		# If resolv.conf is link file then remove it.
+		${SUDO} rm /tmp/tmp-${DATE}/etc/resolv.conf
+	    fi
+	    ${SUDO} mv resolv.conf /tmp/tmp-${DATE}/etc/resolv.conf
+	    cat /tmp/tmp-${DATE}/etc/resolv.conf
+	fi
+	
+	# Hostname replace
+	PrtInfo "Hostname overwrite"
+	if [ -f ../DebianNetFiles/hosts ]; then
+	    cp  ../DebianNetFiles/hosts hosts
+	else
+	    cp /etc/hosts hosts
+	fi
+	if [ -f /tmp/tmp-${DATE}/etc/hostname ] && [ -f /tmp/tmp-${DATE}/etc/hosts ]; then
+	    ReplaceHostname hosts ${GUESTNAME} /tmp/tmp-${DATE}/etc/hosts
+	    ReplaceHostname hostname ${GUESTNAME} /tmp/tmp-${DATE}/etc/hostname
+	    
+	fi
+	cat /tmp/tmp-${DATE}/etc/hosts
+
+	# Host allow permission replace
+	PrtInfo "Hosts allow permission overwrite."
+	if [ -f ../DebianNetFiles/hosts.allow ]; then
+	    cp  ../DebianNetFiles/hosts.allow hosts.allow
+	    if [ -f ../DebianNetFiles/hosts.deny ]; then
+		cp ../DebianNetFiles/hosts.deny hosts.deny
+	    else
+		cp /etc/hosts.deny hosts.deny
+	    fi
+	else
+	    cp /etc/hosts.allow hosts.allow
+	fi
+	if [ -f /tmp/tmp-${DATE}/etc/hosts.allow ] && [ -f /tmp/tmp-${DATE}/etc/hosts.deny ]; then
+	    ${SUDO} mv hosts.allow  /tmp/tmp-${DATE}/etc/hosts.allow
+	    ${SUDO} mv hosts.deny /tmp/tmp-${DATE}/etc/hosts.deny
+	fi
+	cat /tmp/tmp-${DATE}/etc/hosts.allow
+	PrtInfo "Host deny permission overwrite."
+	cat /tmp/tmp-${DATE}/etc/hosts.deny
+
+	
+	# rc.local replace
+	PrtInfo "Create rc.local file"
+	if [ -f /tmp/tmp-${DATE}/etc/rc.local ]; then
+	    ReplaceRclocal $HOSTIP $GW0
+	    ${SUDO} chmod +x rc.local
+	    ${SUDO} mv rc.local /tmp/tmp-${DATE}/etc/rc.local
+	fi
+	cat /tmp/tmp-${DATE}/etc/rc.local
+	
+	# sources list replace
+	PrtInfo "overwrite sourceslist"
+	if [ -f ../DebianNetFiles/sources.list ]; then
+	    cp  ../DebianNetFiles/sources.list sources.list
+	else
+	    cp /etc/sources.list sources.list
+	fi
+	
+	if [ -f /tmp/tmp-${DATE}/etc/apt/sources.list ]; then
+	    ${SUDO} mv sources.list /tmp/tmp-${DATE}/etc/apt/sources.list
+	fi
+	cat /tmp/tmp-${DATE}/etc/apt/sources.list
+
+	# fstab replace
+	PrtInfo "overwrite fstab"
+	cat /tmp/tmp-${DATE}/etc/fstab |sed '/^#/d' |egrep "UUID" &>/dev/null
+	if [ "a$?" == "a0" ]; then
+	    PrtWarn "VM using UUID as fstab"
+	else
+	    if [ "$DiskMode" == "ScsiStorage" ]; then
+		cat /tmp/tmp-${DATE}/etc/fstab |sed '/^#/d' |egrep "vd" &>/dev/null
+		if [ "$?" -eq "0" ]; then
+		    PrtInfo "Replace fstab as scsi disk"
+		    ${SUDO} sed -i 's/\/dev\/vd/\/dev\/sd/g' /tmp/tmp-${DATE}/etc/fstab
+		fi
+	    fi
+	fi
+	cat /tmp/tmp-${DATE}/etc/fstab
+
+	# scp sync initramfs
+	if [ ! -d /tmp/tmp-${DATE}/etc/initramfs/post-update.d/ ]; then
+	    ${SUDO} mkdir -p /tmp/tmp-${DATE}/etc/initramfs/post-update.d
+	fi
+	if [ "${VMARCH}" == "ARM" ]; then
+	    PrtInfo "Create sync initramfs script"
+	    if [ "${ROOTFSTYPE}" == "NFS" ]; then
+		ReflashInitrd $(realpath ../Kernel/${NFSdir})
+	    else
+		ReflashInitrd $(realpath ../Kernel/${GUESTNAME})
+	    fi
+	    ${SUDO} mv 02-scp /tmp/tmp-${DATE}/etc/initramfs/post-update.d/02-scp
+	    cat /tmp/tmp-${DATE}/etc/initramfs/post-update.d/02-scp
+	fi
+	# inittab and securetty replace
+	if [ -f ../DebianNetFiles/inittab ] && [ -f ../DebianNetFiles/securetty ]; then
+	    PrtInfo "overwrite inittab and securetty "
+	    ${SUDO} cp ../DebianNetFiles/inittab /tmp/tmp-${DATE}/etc/inittab
+	    ${SUDO} cp ../DebianNetFiles/securetty /tmp/tmp-${DATE}/etc/securetty
+	fi
+	# ssh overwrite if it exist 
+	if [ -d /tmp/tmp-$DATE/etc/ssh ]; then
+	    if [ -f ../DebianNetFiles/ssh_config ] &&  [ -f ../DebianNetFiles/sshd_config ]; then
+		PrtInfo "overwrite ssh config file "
+		${SUDO} cp ../DebianNetFiles/ssh_config /tmp/tmp-$DATE/etc/ssh/ssh_config
+		${SUDO} cp ../DebianNetFiles/sshd_config /tmp/tmp-$DATE/etc/ssh/sshd_config
+	    fi
+	fi
+	# clean 70-persistent-net.rules
+	if [ -f /tmp/tmp-${DATE}/etc/udev/rules.d/70-persistent-net.rules ];then
+	    PrtInfo "Clean 70-persistent-net.rules"
+	    ${SUDO} rm -rf /tmp/tmp-${DATE}/etc/udev/rules.d/70-persistent-net.rules
+	fi
+	# Check Share mount point 
+	if [ "${MultiShareDir}" == "Yes" ]; then
+	    for ii in $(seq 0  ${ShareLen}); do
+		if [ ! -d /tmp/tmp-${DATE}/${ShareMount[$ii]} ]; then
+		    PrtInfo "Base rootfs no share directory mount point, create new."
+		    ${SUDO} mkdir -p /tmp/tmp-${DATE}/${ShareMount[$ii]}
+		fi
+	    done
+	fi
+	
+    ;;
+esac
+${SUDO} umount /tmp/tmp-${DATE}
+SetupImage down ${LOOPDEV}
+${SUDO} rm -rf /tmp/tmp-${DATE}
+
+# Create start / stop guest machine script 
+PrtInfo "Create scripts for virtual machine."
+CreateBaseScript start "start-${GUESTNAME}.sh"
+CreateBaseScript stop "stop-${GUESTNAME}.sh"
+CreateVmnetInHost $NetMode startnew ${IP[0]} ${TAP[0]} ${ETH[0]} ${MAC[0]} "start-${GUESTNAME}.sh"
+CreateVmnetInHost $NetMode stopnew ${IP[0]} ${TAP[0]} ${ETH[0]} ${MAC[0]} "stop-${GUESTNAME}.sh"
+for ii in $(seq 1 ${NetLen}); do
+    CreateVmnetInHost $NetMode startadd ${IP[$ii]} ${TAP[$ii]} ${ETH[$ii]} ${MAC[$ii]} "start-${GUESTNAME}.sh"
+    CreateVmnetInHost $NetMode stopadd ${IP[$ii]} ${TAP[$ii]} ${ETH[$ii]} ${MAC[$ii]} "stop-${GUESTNAME}.sh"
+done
+echo "rm -rf \${NETWORK_DIR}/" >> stop-${GUESTNAME}.sh
+echo "echo \" Starting VM: \${NAME}...,mem=\${MEM} \"" >>start-${GUESTNAME}.sh
+# Replace name start0 - start8 
+# echo "unset start0 start1 start2 start3 start4 start5 start6 start7 start8" >>start-${GUESTNAME}.sh
+unset PBase PKernel PMon PGA PAppend P9p PNet PDisk POthers
+echo "unset PBase PKernel PMon PGA PAppend P9p PNet PDisk POthers" >>start-${GUESTNAME}.sh
+echo "##Start VM###" >>start-${GUESTNAME}.sh
+cp start-${GUESTNAME}.sh  start-${GUESTNAME}-AsDaemon.sh
+cat<<EOF>>start-${GUESTNAME}-AsDaemon.sh
+# Running on screen
+if ! screen -list | grep \${NAME} ; then
+    screen -S \${NAME} -d -m
+else
+    echo "screen exist, please stop \${NAME} VM first."
+    exit 1
+fi
+EOF
+
+if [ "${VMARCH}" == "ARM" ]; then
+    if [ -f ../Kernel/${GUESTNAME}/zImage ] && [ -f ../Kernel/${GUESTNAME}/initrd.img ]; then
+	PrtInfo "Found custom kernel."
+    else
+	PrtWarn "No zImage and initrd.img found in ../Kernel/${GUESTNAME} directory"
+    fi
+fi
+# Base QEMU
+# PBase means Parameter of Base QEMU value # start0
+start=$(CreateQemuScript base)
+echo "# Base QEMU parameter" >>start-${GUESTNAME}.sh
+echo "# Base QEMU parameter" >>start-${GUESTNAME}-AsDaemon.sh
+echo "PBase=\"$start \"" >> start-${GUESTNAME}.sh
+echo "PBase=\"$start \"" >> start-${GUESTNAME}-AsDaemon.sh
+echo "screen -r \${NAME} -X stuff $\"\$PBase \"" >>start-${GUESTNAME}-AsDaemon.sh
+
+# Kernel if VMARCH=ARM
+if [ "${VMARCH}" == "ARM" ]; then
+    start=$(CreateQemuScript kernel)
+    echo "# Kernel parameter" >>start-${GUESTNAME}.sh
+    echo "# Kernel parameter" >>start-${GUESTNAME}-AsDaemon.sh
+    echo "PKernel=\"$start \"" >> start-${GUESTNAME}.sh
+    echo "PKernel=\"$start \"" >> start-${GUESTNAME}-AsDaemon.sh
+    echo "screen -r \${NAME} -X stuff $\"\$PKernel \"" >>start-${GUESTNAME}-AsDaemon.sh
+fi
+# Monitor
+start=$(CreateQemuScript monitor)
+echo "# Monitor parameter" >>start-${GUESTNAME}.sh
+echo "# Monitor parameter" >>start-${GUESTNAME}-AsDaemon.sh
+echo "PMon=\"$start \"" >> start-${GUESTNAME}.sh
+echo "PMon=\"$start \"" >> start-${GUESTNAME}-AsDaemon.sh
+echo "screen -r \${NAME} -X stuff $\"\$PMon \"" >>start-${GUESTNAME}-AsDaemon.sh
+# Qemu-guest-agent
+if [ "${VMARCH}" == "ARM" ]; then
+    start=$(CreateQemuScript guestagent)
+    echo "# QEMU Guest Agent parameter" >>start-${GUESTNAME}.sh
+    echo "# QEMU Guest Agent parameter" >>start-${GUESTNAME}-AsDaemon.sh
+    # QEMU Guest Agent parameter as PGA
+    echo "PGA=\"$start \"" >> start-${GUESTNAME}.sh
+    echo "PGA=\"$start \"" >> start-${GUESTNAME}-AsDaemon.sh
+    echo "screen -r \${NAME} -X stuff $\"\$PGA \"" >>start-${GUESTNAME}-AsDaemon.sh
+fi
+# APPEND
+if [ "${VMARCH}" == "ARM" ]; then
+    start=$(CreateQemuScript append)
+    echo "# APPEND parameter" >>start-${GUESTNAME}.sh
+    echo "# APPEND parameter" >>start-${GUESTNAME}-AsDaemon.sh
+    echo "PAppend=\" -append \\\"$start\\\" \"" >> start-${GUESTNAME}.sh
+    echo "PAppend=\" -append \\\"$start\\\" \"" >> start-${GUESTNAME}-AsDaemon.sh
+    echo "screen -r \${NAME} -X stuff $\"\$PAppend \"" >>start-${GUESTNAME}-AsDaemon.sh
+fi
+# 9P shared directory
+# base shared /usr/local
+start=$(CreateQemuScript sharedfile base )
+echo "# 9p Shared parameter, default share host /usr/local directory into guest /usr/local directory." >>start-${GUESTNAME}.sh
+echo "# 9p Shared parameter, default share host /usr/local directory into guest /usr/local directory." >>start-${GUESTNAME}-AsDaemon.sh
+echo "P9p=\"$start \"" >> start-${GUESTNAME}.sh
+echo "P9p=\"$start \"" >> start-${GUESTNAME}-AsDaemon.sh
+echo "screen -r \${NAME} -X stuff $\"\$P9p\"" >>start-${GUESTNAME}-AsDaemon.sh
+if [ "${MultiShareDir}" == "Yes" ]; then
+    for ii in $(seq 0 ${ShareLen}); do
+	num=$(( $ii + 1 ))
+	echo "# Share host ${ShareDir[$ii]} into guest ${ShareMount[$ii]}" >>start-${GUESTNAME}.sh
+	echo "# Share host ${ShareDir[$ii]} into guest ${ShareMount[$ii]}" >>start-${GUESTNAME}-AsDaemon.sh
+	start=$(CreateQemuScript sharedfile add ${num} ${ShareDir[$ii]} ${ShareName[$ii]})
+	echo "P9p+=\"$start \"" >> start-${GUESTNAME}.sh
+	echo "P9p$ii=\"$start \"" >> start-${GUESTNAME}-AsDaemon.sh
+	echo "screen -r \${NAME} -X stuff $\"\$P9p$ii\"" >>start-${GUESTNAME}-AsDaemon.sh
+    done
+fi
+# NET
+unset SEQNET
+if [ "${HOSTARCH}" == "ARM" ]; then
+    SEQNET=$(seq $NetLen -1 0 )
+else
+    SEQNET=$(seq 0 $NetLen )
+fi
+echo "# Net parameter" >>start-${GUESTNAME}.sh
+echo "# Net parameter" >>start-${GUESTNAME}-AsDaemon.sh
+echo "PNet=\"\"" >> start-${GUESTNAME}.sh
+for ii in ${SEQNET}; do
+    start=$(CreateQemuScript net ${MAC[$ii]} ${TAP[$ii]} $ii)
+    echo "# VM eth$ii setting" >> start-${GUESTNAME}.sh
+    echo "# VM eth$ii setting" >> start-${GUESTNAME}-AsDaemon.sh
+    echo "PNet+=\"$start \"" >> start-${GUESTNAME}.sh
+    echo "PNet$ii=\"$start \"" >> start-${GUESTNAME}-AsDaemon.sh
+    echo "screen -r \${NAME} -X stuff $\"\$PNet$ii\"" >>start-${GUESTNAME}-AsDaemon.sh
+done
+# HDD
+unset NUM ImageLen
+unset SEQDISK
+ImageLen=$(( ${#IMAGE[@]} -1 ))
+if [ "${HOSTARCH}" == "ARM" ]; then
+    SEQDISK=$(seq $ImageLen -1 0 )
+else
+    SEQDISK=$(seq 0 $ImageLen )
+fi
+echo "# Disk parameter" >>start-${GUESTNAME}.sh
+echo "# Disk parameter" >>start-${GUESTNAME}-AsDaemon.sh
+echo "PDisk=\"\"" >> start-${GUESTNAME}.sh
+# Add scsi mode
+if [ "$DiskMode" == "ScsiStorage" ] && [ "$VMARCH" == "ARM" ]; then
+    echo "# Prepare SCSI bus before using virtio-scsi " >> start-${GUESTNAME}.sh
+    echo "# Prepare SCSI bus before using virtio-scsi " >> start-${GUESTNAME}-AsDaemon.sh
+    echo "PDisk+=\"-device virtio-scsi-device,id=scsi \"" >> start-${GUESTNAME}.sh
+    echo "PDisk=\"-device virtio-scsi-device,id=scsi \"" >> start-${GUESTNAME}-AsDaemon.sh
+    echo "screen -r \${NAME} -X stuff $\"\$PDisk\"" >>start-${GUESTNAME}-AsDaemon.sh
+    SEQDISK=$(seq 0 $ImageLen )
+fi
+
+for ii in ${SEQDISK}; do
+
+    start=$(CreateQemuScript disk ${IMAGE[$ii]})
+    test -z "$start"
+    if [ "$?" -ne "0" ]; then
+	echo "# The number of disk: $ii" >> start-${GUESTNAME}.sh
+	echo "# The number of disk: $ii" >> start-${GUESTNAME}-AsDaemon.sh
+	echo "PDisk+=\"$start \"" >> start-${GUESTNAME}.sh
+	echo "PDisk$ii=\"$start \"" >> start-${GUESTNAME}-AsDaemon.sh
+	echo "screen -r \${NAME} -X stuff $\"\$PDisk$ii\"" >>start-${GUESTNAME}-AsDaemon.sh
+    fi
+done
+# End QEMU
+echo "# Other parameter" >>start-${GUESTNAME}.sh
+echo "# Other parameter" >>start-${GUESTNAME}-AsDaemon.sh
+echo "POthers=\" -pidfile \${PID} \"" >> start-${GUESTNAME}.sh
+echo "POthers=\" -pidfile \${PID} -curses \"" >> start-${GUESTNAME}-AsDaemon.sh
+# End QEMU for foreground
+echo "/bin/bash -c \"\${PBase}\${PKernel}\${PMon}\${PGA}\${PAppend}\${P9p}\${PNet}\${PDisk}\${POthers} \"" >>  start-${GUESTNAME}.sh
+# End QEMU for background
+echo "screen -r \${NAME} -X stuff $\"\$POthers\"" >>start-${GUESTNAME}-AsDaemon.sh
+echo "screen -r \${NAME} -X stuff \$\";exit\$(printf \\\\r) \"" >>start-${GUESTNAME}-AsDaemon.sh
+
+${SUDO} chmod +x  start-${GUESTNAME}.sh  start-${GUESTNAME}-AsDaemon.sh  stop-${GUESTNAME}.sh
+PrtInfo "Auto configure success, output file :"
+ls -l  start-${GUESTNAME}.sh  start-${GUESTNAME}-AsDaemon.sh  stop-${GUESTNAME}.sh

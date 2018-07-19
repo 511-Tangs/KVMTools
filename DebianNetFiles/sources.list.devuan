@@ -1,0 +1,5 @@
+deb [ arch=armhf ] http://auto.mirror.devuan.org/merged jessie main contrib 
+deb [ arch=armhf ] http://auto.mirror.devuan.org/merged jessie-updates main contrib 
+deb [ arch=armhf ] http://auto.mirror.devuan.org/merged jessie-backports main contrib
+deb [ arch=armhf ] http://auto.mirror.devuan.org/merged jessie-security main contrib 
+

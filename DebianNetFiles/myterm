@@ -1,0 +1,4 @@
+#!/bin/sh
+echo Starting Xterm
+xterm -bg yellow -fg black -fa Arial_bold -fs 11 -geometry 90x32+15+5 \
+ -title "My Xterm" -sb -rightbar -sl 10000 +cm +bdc

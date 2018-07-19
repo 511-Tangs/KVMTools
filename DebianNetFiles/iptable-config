@@ -1,0 +1,5 @@
+sudo iptables --flush
+        sudo iptables --table nat --flush
+        sudo iptables --delete-chain
+        sudo iptables --table nat --delete-chain
+        sudo iptables --table nat --append POSTROUTING --out-interface eth0 -j MASQUERADE

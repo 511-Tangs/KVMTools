@@ -1,0 +1,4 @@
+# This file is used to over-write /etc/udev/rules.d/70-persistent-net.rules,
+# an automatically generated (Ubuntu Linux) ether device naming file. 
+# If there is line for "eth2", next time eth device will be given the name:
+# eth3, which is really annoying.

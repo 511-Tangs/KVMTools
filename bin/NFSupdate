@@ -1,0 +1,304 @@
+#!/bin/bash
+## Function Table
+# Print Help
+function PrtHelp() {
+    echo -ne "Usage: $0 Sync NfsIP:NfsVmPath VmLoaclImage \n
+"
+}
+
+# Let image load or out system.
+function SetupImage() {
+    local loopdev image 
+    case $1 in
+	up)
+           loopdev=$2
+	   image=$3
+	   ${SUDO} modprobe nbd max_part=8
+	   ${SUDO} qemu-nbd --connect=${loopdev} $image &>/dev/null
+	   ls -l /dev/nbd0p* &>/dev/null
+	   if [ "$?" -ne "0" ]; then
+	       ${SUDO} partx -av ${loopdev} &>/dev/null
+	   fi   
+	;;
+	down)
+          loopdev=$2
+          ${SUDO} partx -dv ${loopdev} &>/dev/null
+          #${SUDO} losetup -d ${loopdev}
+	  ${SUDO} qemu-nbd --disconnect ${loopdev}
+	  sleep 5
+	  ${SUDO} rmmod nbd 	
+	
+	;;*)
+	
+    esac
+}
+function CheckPackage() {
+    #Deb Package
+    local pkg PKG
+    PKG='rsync nfs-common'
+    for pkg in $PKG; do
+	dpkg -l $pkg &>/dev/null
+	if [ "$?" -ne "0" ]; then
+	    echo >&2"No $pkg deb package installed."
+	    exit 1 
+	fi
+    done
+    echo >&2 "Deb package check all installed."
+    # Binary file
+    local binary Binary
+    Binary='partx sudo qemu-nbd'
+    for binary in $Binary; do
+	which $binary &>/dev/null
+	if [ "$?" -ne "0" ]; then
+	    echo >&2"No binary file $binary found."
+	    exit 1 
+	fi
+    done
+    echo >&2 "All using binary file found."
+}
+# Check Ip correct
+function CheckIpFormat() {
+    local len Ans ip ii
+    len=$(echo $1 |tr "." "\n" |wc -l)
+    if [ "$len" -eq "4" ]; then
+	ii=1
+	for ip in $(echo $1 |tr "." " "); do
+	    [[ $ip =~ ^[0-9]+$ ]] # IP addr is real number 
+	    if [ "$?" -ne "0" ]; then
+		Ans="No"
+		break
+	    fi
+	    # without ip = [255 0].*.*.[255 0]
+	    if [ "$ii" == "1" ]  || [ "$ii" == "4" ]; then
+		#  value <= 0 or value >= 255
+		if [ "$ip" -le 0 ] || [ "$ip" -ge 255 ] ; then
+		    Ans="No"
+		    break
+		else
+		    Ans="Yes"
+		fi
+
+	    else
+		# value < 0 or value >=255
+		if [ "$ip" -lt 0 ] || [ "$ip" -ge 255 ] ; then
+		    Ans="No"
+		    break
+		else
+		    Ans="Yes"
+		fi
+	    fi
+	    ii=$(( $ii + 1 ))
+	done
+    else
+	Ans="No"
+    fi
+    echo $Ans
+}
+
+# Check file is newer
+function CheckNewer() {
+    local test checktest ii testlen
+    # Read all file into array
+    readarray -t test< <(tr " " "\n" <<<$@)
+    # Math Length of array
+    testlen=${#test[@]}
+    # First file
+    checktest=${test[0]}
+    # Test 1 - Length file 
+    for ii in $(seq 1 ${testlen});do
+	# if file B is newer than file A, then keep files B and loop another files.
+	if [[ ${test[$ii]} -nt ${checktest} ]]; then
+	    checktest=${test[$ii]}
+	fi
+    done
+    # Print the newest file
+    echo "$checktest"
+}
+
+
+# Main script 
+
+#Check Package
+CheckPackage
+
+# Check value
+if [ "$#" -lt "3" ]; then
+    PrtHelp
+    exit 127
+fi
+if [ "$1" == "Sync" ]; then
+    echo "Using Sync mode."
+else
+    echo "No mode name: $1 found, exit!"
+    exit 1
+fi
+
+#Check Nfs path correct
+unset Ans NfsPath NfsIP VmPath LocalImage
+NfsPath=$2
+NfsIP=$(awk -F ':' '{print $1}' <<< $NfsPath )
+VmPath=$(awk -F ':' '{print $2}' <<< $NfsPath )
+Ans=$(CheckIpFormat $NfsIP)
+if [ "$Ans" == "Yes" ]; then
+    echo "Ip format correct."
+else
+    echo "Ip format not correct."
+    exit 1
+fi
+
+LocalImage=$3
+if [ -f $LocalImage ]; then
+    echo "Image file found."
+else
+    echo "Image file not found."
+    exit 1 
+fi
+# Get Root permission
+echo "Super user permission test"
+echo "Super User passwd, please:"
+if [ $EUID -ne 0 ]
+   then sudo echo -ne ""
+        if [ $? -ne 0 ]
+            then  echo "Sorry, need su privilege!" ; exit 127
+        else
+            echo "Super user permission  test: succeed."
+            SUDO=$(which sudo)
+        fi
+else
+    SUDO=''
+fi
+
+#Mount Nfs Path
+unset NfsMountPoint
+NfsMountPoint="/tmp/tmp$(date +%y%m%d%H%M%S)"
+mkdir -p $NfsMountPoint
+${SUDO} mount -t nfs $NfsPath $NfsMountPoint 
+
+# Create LocalMountPoint
+unset LocalMountPoint User
+echo "Check Nfs path"
+sleep 1 
+LocalMountPoint="/tmp/tmp$(date +%y%m%d%H%M%S)"
+mkdir -p $LocalMountPoint
+
+# Get local image path from nfs fstab.
+unset EtcPath VarPath
+EtcPath=$(grep '/etc' $NfsMountPoint/etc/fstab |sed '/^#/d' |awk -F ' ' '{print $1}' )
+VarPath=$(grep '/var' $NfsMountPoint/etc/fstab |sed '/^#/d' |awk -F ' ' '{print $1}' )
+
+#If fstab using UUID then quit.
+grep UUID $EtcPath &>/dev/null
+if [ "$?" -eq "0" ]; then
+    echo "Fstab using UUID on Nfs system is not correct, please change fstab as traditional device partition name such as /dev/sdX[0-9] or /dev/vdX[0-9]."
+    sudo umount $NfsMountPoint 
+    rm -r $LocalMountPoint $NfslMountPoint
+    exit 1
+fi
+grep UUID $VarPath &>/dev/null
+if [ "$?" -eq "0" ]; then
+    echo "Fstab using UUID on Nfs system is not correct, please change fstab as traditional device partition name such as /dev/sdX[0-9] or /dev/vdX[0-9]."
+    sudo umount $NfsMountPoint 
+    rm -r $LocalMountPoint $NfsMountPoint
+    exit 1
+fi
+
+
+#Mount Local Image and check etc and var path 
+unset LoopDev MountPoint
+LoopDev=/dev/nbd0
+SetupImage up $LoopDev $LocalImage
+
+#Mount Etc local image and check directory is etc directory.
+MountPoint=$(sed 's/vd[a-z]/nbd0p/g' <<< $EtcPath )
+${SUDO} mount $MountPoint $LocalMountPoint
+# Backup local files
+# Scan local orig file and add into white list 
+LocalFiles=($(find $LocalMountPoint -name "*.orig" 2>/dev/null ))
+if [ ! -f ../DebianNetFiles/nfs.whitelists.etc ]; then
+    echo "Nfs white list is empty, create new."
+    touch ../DebianNetFiles/nfs.whitelists.etc
+fi
+for files in ${LocalFiles[@]}; do
+    echo "Find except file: $files"
+    name=$(tr "/" "\n" <<< $files |grep orig |sed 's/.orig//g')
+    cat ../DebianNetFiles/nfs.whitelists.etc | sed 's/*//g' | egrep -o "^$name$" &>/dev/null
+    if [ "$?" -ne "0" ]; then
+	echo "Add except file: $name"
+	echo "${name}*" >> ../DebianNetFiles/nfs.whitelists.etc 
+	sed -i '/^$/d' ../DebianNetFiles/nfs.whitelists.etc
+    fi
+done
+# Create except file list
+Options='--delete --force --links --delete-after -i --stats -av '
+if [ -f ../DebianNetFiles/nfs.whitelists.etc ]; then
+    if [ ! -z ../DebianNetFiles/nfs.whitelists.etc ]; then
+	Options="$Options --exclude-from=$(realpath ../DebianNetFiles/nfs.whitelists.etc)"
+    fi
+fi
+
+echo "Options is $Options"
+if [ -f $LocalMountPoint/fstab ]; then
+    echo "sync Etc directory"
+    ${SUDO} rsync $Options $NfsMountPoint/etc/ $LocalMountPoint/
+    echo "Check network setting"
+else
+    SetupImage down $LoopDev
+    rm -r $LocalMountPoint
+    echo "Local partition table not match Nfs system table, quit!"
+    exit 1
+fi
+${SUDO} umount $LocalMountPoint
+
+#Mount Var local image and check directory is var directory.
+MountPoint=$(sed 's/vd[a-z]/nbd0p/g' <<< $VarPath )
+
+Options='--delete --force --links --delete-after -i --stats -av '
+if [ -f ../DebianNetFiles/nfs.whitelists.varlib ]; then
+    if [ ! -z ../DebianNetFiles/nfs.whitelists.varlib ]; then
+	Options="$Options --exclude-from=$(realpath ../DebianNetFiles/nfs.whitelists.varlib)"
+    fi
+fi
+
+${SUDO} mount $MountPoint $LocalMountPoint
+
+# Scan local orig file and add into white list 
+LocalFiles=($(find $LocalMountPoint -name "*.orig" 2>/dev/null ))
+if [ ! -f ../DebianNetFiles/nfs.whitelists.varlib ]; then
+    echo "Nfs white list is empty, create new."
+    touch ../DebianNetFiles/nfs.whitelists.varlib
+fi
+for files in ${LocalFiles[@]}; do
+    echo "Find except file: $files"
+    name=$(tr "/" "\n" <<< $files |grep orig |sed 's/.orig//g')
+    cat ../DebianNetFiles/nfs.whitelists.varlib |sed 's/*//g' | egrep -o "^$name$" &>/dev/null
+    if [ "$?" -ne "0" ]; then
+	echo "Add except file: $name"
+	echo "${name}*" >> ../DebianNetFiles/nfs.whitelists.varlib 
+	sed -i '/^$/d' ../DebianNetFiles/nfs.whitelists.varlib
+    fi
+done
+
+if [ -d $LocalMountPoint/lib ]; then
+    echo "sync /var/lib directory"
+    ${SUDO} rsync $Options $NfsMountPoint/var/lib/ $LocalMountPoint/lib/
+else
+    SetupImage down $LoopDev
+    rm -r $LocalMountPoint
+    echo "Local partition table not match Nfs system table, quit!"
+    exit 1
+fi
+${SUDO} umount $LocalMountPoint
+SetupImage down $LoopDev
+
+
+#Copy kernel files 
+zImage=$(CheckNewer $(${SUDO} find $NfsMountPoint/boot/ -type f -name "vmlinuz-*" 2>/dev/null))
+initrd=$(sed 's/vmlinuz/initrd.img/g' <<< $zImage )
+NfsDir="../Kernel/$(sed 's/\///g' <<< $VmPath)"
+echo "Update kernel into directory: $NfsDir"
+cp $zImage $NfsDir/zImage
+cp $initrd $NfsDir/initrd.img
+
+echo "Sync Nfs system finsh."
+${SUDO} umount $NfsMountPoint
+rm -r $LocalMountPoint $NfsMountPoint

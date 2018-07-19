@@ -1,0 +1,42 @@
+#!/bin/sh -e
+#
+# rc.local
+#
+# This script is executed at the end of each multiuser runlevel.
+# Make sure that the script will "exit 0" on success or any other
+# value on error.
+#
+# In order to enable or disable this script just change the execution
+# bits.
+#
+# By default this script does nothing.
+# /etc/init.d/ntp stop
+# Test if power failure
+if [ -f /etc/nologin ]; then
+    echo "Login lock with message :$(cat /etc/nologin)" |tee /dev/kmsg
+    rm -f /etc/nologin
+fi
+ntpdate 140.120.?.?
+# /etc/init.d/ntp start
+/usr/local/bin/control_fan.sh change 50 100 # Temp more than 55 will run
+/usr/local/bin/Network-Speedup.sh # Replace network using A15 cpu
+#ip addr add 192.168.0.254/24 dev eth0 # Host Lan
+ifconfig eth1 192.168.10.254/24 # Host Lan using USB network port
+#ip addr add 192.168.1.254/24 dev eth0 # Vm Lan 1
+/usr/local/bin/VLAN.sh start eth2 192.168.0.254 eth0 # Host Lan
+/usr/local/bin/VLAN.sh start eth3 192.168.1.254 eth0 # Vm Lan 1
+#ip addr add 192.168.2.254/24 dev eth0 # Vm Lan 2
+/usr/local/bin/VLAN.sh start eth4 192.168.2.254 eth0 # Vm Lan 2
+#ip addr add 192.168.3.254/24 dev eth0 # Vm Lan 3
+/usr/local/bin/VLAN.sh start eth5 192.168.3.254 eth0 # Vm Lan 3
+# NAT Host Lan
+iptables -t nat -A POSTROUTING -o eth0 -s 192.168.0.0/24 -j SNAT --to 120.120.?.?
+iptables -t nat -A POSTROUTING -o eth0 -s 192.168.0.0/24 -j MASQUERADE
+# Ip forward
+sysctl net.ipv4.ip_forward=1
+/etc/init.d/quagga stop
+/etc/init.d/quagga start
+# Mount sdb
+mount /dev/sdb1 /srv/nfs/0
+mount /dev/sdb2 /srv/nfs/1
+exit 0
