@@ -11,23 +11,22 @@ function SetupImage() {
     local loopdev image 
     case $1 in
 	up)
-           loopdev=$2
-	   image=$3
-	   ${SUDO} modprobe nbd max_part=8
-	   ${SUDO} qemu-nbd --connect=${loopdev} $image &>/dev/null
-	   ls -l /dev/nbd0p* &>/dev/null
+           #loopdev=$2
+	   image=$2
+	   loopdev=$(${SUDO} losetup -f --show $image )
+	   #${SUDO} modprobe nbd max_part=8
+	   #${SUDO} qemu-nbd --connect=${loopdev} $image &>/dev/null
+	   ls -l ${loopdev}p* &>/dev/null
 	   if [ "$?" -ne "0" ]; then
 	       ${SUDO} partx -av ${loopdev} &>/dev/null
-	   fi   
+	   fi
+	   echo $loopdev
 	;;
 	down)
           loopdev=$2
           ${SUDO} partx -dv ${loopdev} &>/dev/null
-          #${SUDO} losetup -d ${loopdev}
-	  ${SUDO} qemu-nbd --disconnect ${loopdev}
+          ${SUDO} losetup -d ${loopdev}
 	  sleep 5
-	  ${SUDO} rmmod nbd 	
-	
 	;;*)
 	
     esac
@@ -148,7 +147,7 @@ fi
 
 LocalImage=$3
 if [ -f $LocalImage ]; then
-    echo "Image file found."
+    echo "Image file found, $LocalImage."
 else
     echo "Image file not found."
     exit 1 
@@ -205,11 +204,16 @@ fi
 
 #Mount Local Image and check etc and var path 
 unset LoopDev MountPoint
-LoopDev=/dev/nbd0
-SetupImage up $LoopDev $LocalImage
+LoopDev=$(SetupImage up $LocalImage)
 
 #Mount Etc local image and check directory is etc directory.
-MountPoint=$(sed 's/vd[a-z]/nbd0p/g' <<< $EtcPath )
+egrep vd <<< $EtcPath &>/dev/null
+if [ "$?" -eq "0" ]; then
+    MountPoint=${LoopDev}$(sed "s/\/dev\/vd[a-z]/p/g" <<< $EtcPath )
+else
+    MountPoint=${LoopDev}$(sed "s/\/dev\/sd[a-z]/p/g" <<< $EtcPath )
+    
+fi
 ${SUDO} mount $MountPoint $LocalMountPoint
 # Backup local files
 # Scan local orig file and add into white list 
@@ -250,7 +254,13 @@ fi
 ${SUDO} umount $LocalMountPoint
 
 #Mount Var local image and check directory is var directory.
-MountPoint=$(sed 's/vd[a-z]/nbd0p/g' <<< $VarPath )
+egrep vd <<< $VarPath &>/dev/null
+if [ "$?" -eq "0" ]; then
+    MountPoint=${LoopDev}$(sed "s/\/dev\/vd[a-z]/p/g" <<< $VarPath )
+else
+    MountPoint=${LoopDev}$(sed "s/\/dev\/sd[a-z]/p/g" <<< $VarPath )
+    
+fi
 
 Options='--delete --force --links --delete-after -i --stats -av '
 if [ -f ../DebianNetFiles/nfs.whitelists.varlib ]; then
