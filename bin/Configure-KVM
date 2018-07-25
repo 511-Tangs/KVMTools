@@ -333,7 +333,7 @@ function CheckDiskMode() {
 	# Old version using vda as default
 	#Mode="BaseStorage"
 	# New version using sda(scsi) as default
-	Mode="ScsiStorage"
+	Mode=$DefStorageMode
 	NeedShift="No"
     else
 	case "$1" in
@@ -345,6 +345,7 @@ function CheckDiskMode() {
 	       Mode="BaseStorage"
 	       NeedShift="Yes"
 	       ;;*)
+	       Mode="Unknown"
     esac
 
     fi
@@ -778,7 +779,11 @@ function ArchTag() {
     local mode arch init file realfile arch
     file=$1
     arch=$( objdump -x $file 2>/dev/null |egrep architecture |awk -F ',' '{print $1}'| tr " " "\n" |sed '1d' )
-
+    if [ -z $arch ]; then
+	# file $1, replace ',' to new line, delete $1 message, replace ' ' to new line
+	# delete empty line, read first value as arch tag.
+	arch=$( file $1 |tr "," "\n" |sed '1d'|tr " " "\n"| sed '/^$/d' |head -n1 )
+    fi
     # Test arch is unknow
     egrep "UNKNOWN" <<<$arch &>/dev/null
     if [ "$?" -eq "0" ]; then
@@ -787,37 +792,51 @@ function ArchTag() {
 	fi
 	arch=$(file $file |awk -F ',' '{print $2}' |sed 's/ //g')
     fi
-    
-    # Test arch is arm arch
-    egrep [aA][rR][mM] <<<$arch &>/dev/null
+    # Test arch is arm or aarch64
+    egrep [aA] <<< $arch &>/dev/null
     if [ "$?" -eq "0" ]; then
-	echo "ARM"
-	# Test arch is arm64 arch
+        # Test arch is arm arch
+	egrep [aA][rR][mM] <<<$arch &>/dev/null
+	if [ "$?" -eq "0" ]; then
+	    egrep [aA][aA][rR][cC][hH] <<< $arch &>/dev/null
+	    if [ "$?" -eq "0" ]; then
+		echo "ARM"
+		return 64
+	    else
+		echo "ARM"
+		return 32
+	    fi
+	fi
+
+        # Test arch is arm64 arch
 	egrep [aA][aA][rR][cC][hH] <<< $arch &>/dev/null
 	if [ "$?" -eq "0" ]; then
+	    echo "ARM"
 	    return 64
-	else
-	    return 32
 	fi
-    fi
 
-    # Test arch is x86_64 arch
-    egrep [xX]86_64 <<<$arch &>/dev/null
-    if [ "$?" -eq "0" ]; then
-	echo "x86_64"
-    fi
+        # Test arch is amd64 arch
+	egrep [aA][mM][dD]64 <<<$arch &>/dev/null
+	if [ "$?" -eq "0" ]; then
+	    echo "x86_64"
+	fi
+	
+	
+    else
+        # Test arch is x86_64 arch
+	egrep [xX]86_64 <<<$arch &>/dev/null
+	if [ "$?" -eq "0" ]; then
+	    echo "x86_64"
+	fi
+	
+        # Test arch is x86-64 arch
+	egrep [xX]86-64 <<<$arch &>/dev/null
+	if [ "$?" -eq "0" ]; then
+	    echo "x86_64"
+	fi
 
-    # Test arch is x86-64 arch
-    egrep [xX]86-64 <<<$arch &>/dev/null
-    if [ "$?" -eq "0" ]; then
-	echo "x86_64"
     fi
-
-    # Test arch is amd64 arch
-    egrep [aA][mM][dD]64 <<<$arch &>/dev/null
-    if [ "$?" -eq "0" ]; then
-	echo "x86_64"
-    fi
+    
 
 }
 
@@ -1900,20 +1919,26 @@ fi
 
 # Set Disk
 PrtInfo "Check Disk value"
-unset DiskLen  QEMUIMG DiskInfo CheckDiskPath ROOTFSTYPE ROOTFS Checkpartition etcnum varnum tmpnum homenum VMARCH NFSdir KernelPath NFSKernelNew CMD DiskMode
+unset DiskLen  QEMUIMG DiskInfo CheckDiskPath ROOTFSTYPE ROOTFS Checkpartition etcnum varnum tmpnum homenum VMARCH NFSdir KernelPath NFSKernelNew CMD DiskMode DefStorageMode
 # Check Disk mode
+DefStorageMode="ScsiStorage"
 Ans=($(CheckDiskMode ${IMAGE[@]}))
-if [ -z ${Ans[0]} ]; then
-    PrtErr "QEMU storage format list : Base, Scsi"
-fi
-DiskMode=${Ans[0]}
-if [ "$DiskMode" == "ScsiStorage" ]; then
-    PreFixDisk="sd"
-elif [ "$DiskMode" == "BaseStorage" ];then
-    PreFixDisk="vd"
+if [ ${Ans[0]} == "Unknown" ]; then
+    PrtWarn "Unknown storage format, using default format $DefStorageMode."    
+    DiskMode=$DefStorageMode
+else
+    DiskMode=${Ans[0]}
 fi
 
-PrtInfo "QEMU storage mode: $DiskMode"
+
+if [ "$DiskMode" == "ScsiStorage" ]; then
+    PreFixDisk="sd"
+    PrtInfo "QEMU storage mode: $DiskMode"
+elif [ "$DiskMode" == "BaseStorage" ];then
+    PreFixDisk="vd"
+    PrtInfo "QEMU storage mode: $DiskMode"
+fi
+
 # If neet shift array do shift.
 if [ "${Ans[1]}" == "Yes" ]; then
     IMAGE=(${IMAGE[@]:1})
@@ -2208,7 +2233,6 @@ case ${ROOTFSTYPE} in
 		    ;;*)
 			    
 	    esac
-
 	    Ans=$(ArchTest match "$HOSTARCH" "$VMARCH" )
 	    if [ "${Ans}" == "Yes" ]; then
 		VMARCH=$(ArchTag /tmp/tmp-$DATE/sbin/init )
