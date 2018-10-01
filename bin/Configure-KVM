@@ -511,7 +511,6 @@ function check-same-subnet() {
 	    Ans=No
 	fi
 	echo $Ans
-
 	;;*)
 	
     esac
@@ -1739,7 +1738,7 @@ fi
 
 # Set Net 
 # PrtInfo "Check Net value"
-unset NetLen IP testifconfig HOSTIP HOSTMASK CheckGW NetGW NetMode
+unset NetLen IP testifconfig HOSTIP HOSTMASK CheckGW NetGW NetMode UsingCustom CGW
 # Check Net mode
 Ans=($(CheckNetMode ${NET[@]}))
 if [ -z ${Ans[0]} ]; then
@@ -1755,19 +1754,6 @@ NetLen=$((${#NET[@]} -1 )) # N Len, using 0 to N-1
 testifconfig=$(/sbin/ifconfig |egrep -o "inet [0-9]+.[0-9]+.[0-9]+.[0-9]+")
 
 for ii  in $(seq 0 ${NetLen}); do
-    # First value need to check gateway ip address
-    if [ "$ii" -eq "0" ]; then
-	# Loading custom gateway if it exist.
-	GW0=$(awk -F ',' '{print $3}' <<< ${NET[$ii]} ) # GW0
-	Ans=$(CheckIpFormat ${GW0})
-	if [ "$Ans" == "Yes" ]; then
-	    PrtInfo "Using custom gateway: $GW0"
-	    CheckGW='Yes'
-	else
-	    CheckGW='No'
-	fi
-
-    fi
     # Let ip address and connect host ether card tranform to array
     IP[$ii]=$(awk -F ',' '{print $1}' <<< ${NET[$ii]} ) # IP[0] == IP0
     ETH[$ii]=$(awk -F ',' '{print $2}' <<< ${NET[$ii]} ) # ETH[0] ==ETH0
@@ -1810,12 +1796,32 @@ for ii  in $(seq 0 ${NetLen}); do
     PrtInfo "Guest eth$ii's Mac$ii is ${MAC[$ii]} and connect to tap name is ${TAP[$ii]}."
     # PrtInfo "Tap$ii ip is ${HOSTIP[$ii]} and mask ${HOSTMASK[$ii]}." # Not importent
 
+    # First value need to check gateway ip address
+    if [ "$ii" -eq "0" ]; then
+	# Loading custom gateway if it exist.
+	# Set custom gateway, and start to check gateway same subnet 
+        CGw=$(awk -F ',' '{print $3}' <<< ${NET[$ii]} ) # GW0
+	Ans=$(CheckIpFormat ${CGW})
+	if [ "$Ans" == "Yes" ]; then
+	    PrtInfo "Custom gateway has correct format."
+	    Ans=($(check-same-subnet private ${CGW}))
+	    if [ "${Ans[0]}" == "Yes" ];then
+	        CheckGW='Yes'
+	    else
+	        CheckGW='No'
+	    fi
+	    UsingCustom='Yes'
+	else
+	    CheckGW='No'
+	fi
+
+    fi
 # Check IPs
     if [ "$ii" -eq "0" ]; then
 	# If not using custom gateway
-	if [ ! "$CheckGW" == "Yes" ]; then
+	if [ ! "$UsingCustom" == "Yes" ]; then
 	    # check vm ip and host are same subnet.
-	    Ans=($(check-same-subnet subnet ${IP[$ii]} ${ETH[$ii]}))
+	    Ans=($(subnet ${IP[$ii]} ${ETH[$ii]}))
 	    if [ "${Ans[0]}" == "Yes" ]; then
 		PrtInfo "Guest IP has same subnet, checking correct gateway"
 		HOSTIP[$ii]=${Ans[1]}
