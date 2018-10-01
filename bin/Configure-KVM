@@ -1808,7 +1808,12 @@ for ii  in $(seq 0 ${NetLen}); do
 	    if [ "${Ans[0]}" == "Yes" ];then
 	        CheckGW='Yes'
 	    else
-	        CheckGW='No'
+	        Ans=$(check-same-subnet private ${IP[$ii]})
+		if [ "${Ans[0]}" == "Yes" ];then
+		        CheckGW='Yes'
+		else
+			CheckGW='No'
+		fi
 	    fi
 	    UsingCustom='Yes'
 	else
