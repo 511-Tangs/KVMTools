@@ -1821,7 +1821,7 @@ for ii  in $(seq 0 ${NetLen}); do
 	# If not using custom gateway
 	if [ ! "$UsingCustom" == "Yes" ]; then
 	    # check vm ip and host are same subnet.
-	    Ans=($(subnet ${IP[$ii]} ${ETH[$ii]}))
+	    Ans=($(check-same-subnet subnet ${IP[$ii]} ${ETH[$ii]}))
 	    if [ "${Ans[0]}" == "Yes" ]; then
 		PrtInfo "Guest IP has same subnet, checking correct gateway"
 		HOSTIP[$ii]=${Ans[1]}
