@@ -1224,14 +1224,15 @@ if [ -f ${PID} ];then
         echo "Check VM screen status."
         if [ $(screen -ls |grep ached |awk -F ' ' '{print $1}'|awk -F '.' '{print $2}'|grep "^${NAME}$"|wc -l) == "1" ]; then
             ## Check screnn as Detached
+            screenName=$(screen -list |egrep ${NAME} |awk '{print $1}' | egrep "[0-9]+.${NAME}$")
             if [ $(screen -ls |grep ached |grep Detached|awk -F ' ' '{print $1}'|awk -F '.' '{print $2}'|grep "^${NAME}$"|wc -l) == "1" ];then
                 echo "Start to shutdown by screen. "
             else
                 echo "Some one using screen Attached, start logout screen user."
-                screen -D ${NAME}
+                screen -D ${screenName}
             fi
             ## Start to shutdown by screen
-            screen -r ${NAME} -X stuff "init 0 $(printf \\r)"
+            screen -r ${screenName} -X stuff "init 0 $(printf \\r)"
             echo "Wait for 20 seconds"
             sleep 20
         else
@@ -2668,7 +2669,9 @@ echo "##Start VM###" >>start-${GUESTNAME}.sh
 cp start-${GUESTNAME}.sh  start-${GUESTNAME}-AsDaemon.sh
 cat<<EOF>>start-${GUESTNAME}-AsDaemon.sh
 # Running on screen
-if ! screen -list | grep \${NAME} ; then
+screen -list |egrep \${NAME} | awk '{print \$1}' |awk -F '.' '{print \$2}' |egrep "^\${NAME}\$" &>/dev/null
+if [ "\$?" -ne "0" ]; then
+    screenName=\$(screen -list |egrep \${NAME} |awk '{print \$1}' | egrep "[0-9]+.\${NAME}\$")
     screen -S \${NAME} -d -m
 else
     echo "screen exist, please stop \${NAME} VM first."
@@ -2690,7 +2693,7 @@ echo "# Base QEMU parameter" >>start-${GUESTNAME}.sh
 echo "# Base QEMU parameter" >>start-${GUESTNAME}-AsDaemon.sh
 echo "PBase=\"$start \"" >> start-${GUESTNAME}.sh
 echo "PBase=\"$start \"" >> start-${GUESTNAME}-AsDaemon.sh
-echo "screen -r \${NAME} -X stuff $\"\$PBase \"" >>start-${GUESTNAME}-AsDaemon.sh
+echo "screen -r \${screenName} -X stuff $\"\$PBase \"" >>start-${GUESTNAME}-AsDaemon.sh
 
 # Kernel if VMARCH=ARM
 if [ "${VMARCH}" == "ARM" ]; then
@@ -2699,7 +2702,7 @@ if [ "${VMARCH}" == "ARM" ]; then
     echo "# Kernel parameter" >>start-${GUESTNAME}-AsDaemon.sh
     echo "PKernel=\"$start \"" >> start-${GUESTNAME}.sh
     echo "PKernel=\"$start \"" >> start-${GUESTNAME}-AsDaemon.sh
-    echo "screen -r \${NAME} -X stuff $\"\$PKernel \"" >>start-${GUESTNAME}-AsDaemon.sh
+    echo "screen -r \${screenName} -X stuff $\"\$PKernel \"" >>start-${GUESTNAME}-AsDaemon.sh
 fi
 # Monitor
 start=$(CreateQemuScript monitor)
@@ -2707,7 +2710,7 @@ echo "# Monitor parameter" >>start-${GUESTNAME}.sh
 echo "# Monitor parameter" >>start-${GUESTNAME}-AsDaemon.sh
 echo "PMon=\"$start \"" >> start-${GUESTNAME}.sh
 echo "PMon=\"$start \"" >> start-${GUESTNAME}-AsDaemon.sh
-echo "screen -r \${NAME} -X stuff $\"\$PMon \"" >>start-${GUESTNAME}-AsDaemon.sh
+echo "screen -r \${screenName} -X stuff $\"\$PMon \"" >>start-${GUESTNAME}-AsDaemon.sh
 # Qemu-guest-agent
 if [ "${VMARCH}" == "ARM" ]; then
     start=$(CreateQemuScript guestagent)
@@ -2716,7 +2719,7 @@ if [ "${VMARCH}" == "ARM" ]; then
     # QEMU Guest Agent parameter as PGA
     echo "PGA=\"$start \"" >> start-${GUESTNAME}.sh
     echo "PGA=\"$start \"" >> start-${GUESTNAME}-AsDaemon.sh
-    echo "screen -r \${NAME} -X stuff $\"\$PGA \"" >>start-${GUESTNAME}-AsDaemon.sh
+    echo "screen -r \${screenName} -X stuff $\"\$PGA \"" >>start-${GUESTNAME}-AsDaemon.sh
 fi
 # APPEND
 if [ "${VMARCH}" == "ARM" ]; then
@@ -2725,7 +2728,7 @@ if [ "${VMARCH}" == "ARM" ]; then
     echo "# APPEND parameter" >>start-${GUESTNAME}-AsDaemon.sh
     echo "PAppend=\" -append \\\"$start\\\" \"" >> start-${GUESTNAME}.sh
     echo "PAppend=\" -append \\\"$start\\\" \"" >> start-${GUESTNAME}-AsDaemon.sh
-    echo "screen -r \${NAME} -X stuff $\"\$PAppend \"" >>start-${GUESTNAME}-AsDaemon.sh
+    echo "screen -r \${screenName} -X stuff $\"\$PAppend \"" >>start-${GUESTNAME}-AsDaemon.sh
 fi
 # 9P shared directory
 # base shared /usr/local
@@ -2734,7 +2737,7 @@ echo "# 9p Shared parameter, default share host /usr/local directory into guest 
 echo "# 9p Shared parameter, default share host /usr/local directory into guest /usr/local directory." >>start-${GUESTNAME}-AsDaemon.sh
 echo "P9p=\"$start \"" >> start-${GUESTNAME}.sh
 echo "P9p=\"$start \"" >> start-${GUESTNAME}-AsDaemon.sh
-echo "screen -r \${NAME} -X stuff $\"\$P9p\"" >>start-${GUESTNAME}-AsDaemon.sh
+echo "screen -r \${screenName} -X stuff $\"\$P9p\"" >>start-${GUESTNAME}-AsDaemon.sh
 if [ "${MultiShareDir}" == "Yes" ]; then
     for ii in $(seq 0 ${ShareLen}); do
 	num=$(( $ii + 1 ))
@@ -2743,7 +2746,7 @@ if [ "${MultiShareDir}" == "Yes" ]; then
 	start=$(CreateQemuScript sharedfile add ${num} ${ShareDir[$ii]} ${ShareName[$ii]})
 	echo "P9p+=\"$start \"" >> start-${GUESTNAME}.sh
 	echo "P9p$ii=\"$start \"" >> start-${GUESTNAME}-AsDaemon.sh
-	echo "screen -r \${NAME} -X stuff $\"\$P9p$ii\"" >>start-${GUESTNAME}-AsDaemon.sh
+	echo "screen -r \${screenName} -X stuff $\"\$P9p$ii\"" >>start-${GUESTNAME}-AsDaemon.sh
     done
 fi
 # NET
@@ -2762,7 +2765,7 @@ for ii in ${SEQNET}; do
     echo "# VM eth$ii setting" >> start-${GUESTNAME}-AsDaemon.sh
     echo "PNet+=\"$start \"" >> start-${GUESTNAME}.sh
     echo "PNet$ii=\"$start \"" >> start-${GUESTNAME}-AsDaemon.sh
-    echo "screen -r \${NAME} -X stuff $\"\$PNet$ii\"" >>start-${GUESTNAME}-AsDaemon.sh
+    echo "screen -r \${screenName} -X stuff $\"\$PNet$ii\"" >>start-${GUESTNAME}-AsDaemon.sh
 done
 # HDD
 unset NUM ImageLen
@@ -2782,7 +2785,7 @@ if [ "$DiskMode" == "ScsiStorage" ] && [ "$VMARCH" == "ARM" ]; then
     echo "# Prepare SCSI bus before using virtio-scsi " >> start-${GUESTNAME}-AsDaemon.sh
     echo "PDisk+=\"-device virtio-scsi-device,id=scsi \"" >> start-${GUESTNAME}.sh
     echo "PDisk=\"-device virtio-scsi-device,id=scsi \"" >> start-${GUESTNAME}-AsDaemon.sh
-    echo "screen -r \${NAME} -X stuff $\"\$PDisk\"" >>start-${GUESTNAME}-AsDaemon.sh
+    echo "screen -r \${screenName} -X stuff $\"\$PDisk\"" >>start-${GUESTNAME}-AsDaemon.sh
     SEQDISK=$(seq 0 $ImageLen )
 fi
 
@@ -2795,7 +2798,7 @@ for ii in ${SEQDISK}; do
 	echo "# The number of disk: $ii" >> start-${GUESTNAME}-AsDaemon.sh
 	echo "PDisk+=\"$start \"" >> start-${GUESTNAME}.sh
 	echo "PDisk$ii=\"$start \"" >> start-${GUESTNAME}-AsDaemon.sh
-	echo "screen -r \${NAME} -X stuff $\"\$PDisk$ii\"" >>start-${GUESTNAME}-AsDaemon.sh
+	echo "screen -r \${screenName} -X stuff $\"\$PDisk$ii\"" >>start-${GUESTNAME}-AsDaemon.sh
     fi
 done
 # End QEMU
@@ -2806,8 +2809,8 @@ echo "POthers=\" -pidfile \${PID} -curses \"" >> start-${GUESTNAME}-AsDaemon.sh
 # End QEMU for foreground
 echo "/bin/bash -c \"\${PBase}\${PKernel}\${PMon}\${PGA}\${PAppend}\${P9p}\${PNet}\${PDisk}\${POthers} \"" >>  start-${GUESTNAME}.sh
 # End QEMU for background
-echo "screen -r \${NAME} -X stuff $\"\$POthers\"" >>start-${GUESTNAME}-AsDaemon.sh
-echo "screen -r \${NAME} -X stuff \$\";exit\$(printf \\\\r) \"" >>start-${GUESTNAME}-AsDaemon.sh
+echo "screen -r \${screenName} -X stuff $\"\$POthers\"" >>start-${GUESTNAME}-AsDaemon.sh
+echo "screen -r \${screenName} -X stuff \$\";exit\$(printf \\\\r) \"" >>start-${GUESTNAME}-AsDaemon.sh
 
 ${SUDO} chmod +x  start-${GUESTNAME}.sh  start-${GUESTNAME}-AsDaemon.sh  stop-${GUESTNAME}.sh
 PrtInfo "Auto configure success, output file :"
