@@ -113,7 +113,17 @@ function CheckNeededPackages() {
 	Ans=No
 	
     fi
-
+    which kvm &>/dev/null
+    if [ "$?" -eq "0" ];then
+        version=$(kvm --version|egrep '^QEMU'| egrep -o 'version [0-9]+.[0-9]+.[0-9]+'|sed 's/version\ //g')
+        v1=$(echo $version | awk -F '.' '{print $1}')
+        v2=$(echo $version | awk -F '.' '{print $2}')
+        if [ "$v1" -gt "2" ];then
+            newscsi="YES"
+        elif ["$v1" -eq "2" ] && [ "$v2" -ge "12" ];then
+            newscsi="YES"
+        fi
+    fi
     if [ ! -f /sbin/mount.nfs ]; then
 	echo -ne "nfs-common not installed.\n"
 	Ans=No
@@ -1553,8 +1563,11 @@ function CreateQemuScript() {
 				       echo "-drive if=none,id=hdd${num},file=${disk},format=raw -device scsi-hd,drive=hdd${num} "
 				       
 				   else
-				       echo "-drive if=scsi,id=hdd${num},file=${disk},format=raw "
-				       
+                                       if [ "$newscsi" == "YES" ];then
+				           echo "-drive if=none,id=hdd${num},file=${disk},format=raw -device scsi-hd,drive=hdd${num} "
+                                       else
+				           echo "-drive if=scsi,id=hdd${num},file=${disk},format=raw "
+				       fi
 				   fi
 			       fi
 			   fi
@@ -1589,7 +1602,11 @@ function CreateQemuScript() {
 				    echo "-drive if=none,id=hdd${num},file=${disk},format=raw -device scsi-hd,drive=hdd${num} "
 				    
 				else
-				    echo "-drive if=scsi,id=hdd${num},file=${disk},format=raw "
+                                       if [ "$newscsi" == "YES" ];then
+				           echo "-drive if=none,id=hdd${num},file=${disk},format=raw -device scsi-hd,drive=hdd${num} "
+                                       else
+				           echo "-drive if=scsi,id=hdd${num},file=${disk},format=raw "
+				       fi
 				    
 				fi
 			    fi
@@ -2777,13 +2794,22 @@ echo "# Disk parameter" >>start-${GUESTNAME}.sh
 echo "# Disk parameter" >>start-${GUESTNAME}-AsDaemon.sh
 echo "PDisk=\"\"" >> start-${GUESTNAME}.sh
 # Add scsi mode
-if [ "$DiskMode" == "ScsiStorage" ] && [ "$VMARCH" == "ARM" ]; then
-    echo "# Prepare SCSI bus before using virtio-scsi " >> start-${GUESTNAME}.sh
-    echo "# Prepare SCSI bus before using virtio-scsi " >> start-${GUESTNAME}-AsDaemon.sh
-    echo "PDisk+=\"-device virtio-scsi-device,id=scsi \"" >> start-${GUESTNAME}.sh
-    echo "PDisk=\"-device virtio-scsi-device,id=scsi \"" >> start-${GUESTNAME}-AsDaemon.sh
-    echo "screen -r \${NAME} -X stuff $\"\$PDisk\"" >>start-${GUESTNAME}-AsDaemon.sh
-    SEQDISK=$(seq 0 $ImageLen )
+if [ "$DiskMode" == "ScsiStorage" ];then
+    if [ "$VMARCH" == "ARM" ];then
+        echo "# Prepare SCSI bus before using virtio-scsi " >> start-${GUESTNAME}.sh
+        echo "# Prepare SCSI bus before using virtio-scsi " >> start-${GUESTNAME}-AsDaemon.sh
+        echo "PDisk+=\"-device virtio-scsi-device,id=scsi \"" >> start-${GUESTNAME}.sh
+        echo "PDisk=\"-device virtio-scsi-device,id=scsi \"" >> start-${GUESTNAME}-AsDaemon.sh
+        echo "screen -r \${NAME} -X stuff $\"\$PDisk\"" >>start-${GUESTNAME}-AsDaemon.sh
+        SEQDISK=$(seq 0 $ImageLen )
+    elif [ "$newscsi" == "YES" ]; then
+        echo "# Prepare SCSI bus before using virtio-scsi " >> start-${GUESTNAME}.sh
+        echo "# Prepare SCSI bus before using virtio-scsi " >> start-${GUESTNAME}-AsDaemon.sh
+        echo "PDisk+=\"-device virtio-scsi-pci,id=scsi \"" >> start-${GUESTNAME}.sh
+        echo "PDisk=\"-device virtio-scsi-pci,id=scsi \"" >> start-${GUESTNAME}-AsDaemon.sh
+        echo "screen -r \${NAME} -X stuff $\"\$PDisk\"" >>start-${GUESTNAME}-AsDaemon.sh
+        SEQDISK=$(seq 0 $ImageLen )
+    fi
 fi
 
 for ii in ${SEQDISK}; do
